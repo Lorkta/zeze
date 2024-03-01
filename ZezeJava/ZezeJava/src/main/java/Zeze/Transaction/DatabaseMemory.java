@@ -235,6 +235,21 @@ public final class DatabaseMemory extends Database implements Database.Operates 
 		}
 
 		@Override
+		public void clear() {
+			map.clear();
+		}
+
+		@Override
+		public long getSize() {
+			return map.size();
+		}
+
+		@Override
+		public long getSizeApproximation() {
+			return map.size();
+		}
+
+		@Override
 		public long walk(TableWalkHandleRaw callback) {
 			ByteBuffer[] keys;
 			byte[][] values;

@@ -227,6 +227,26 @@ public class DatabaseRocksDb extends Database {
 		}
 
 		@Override
+		public long getSize() {
+			try (var it = table.iterator()) {
+				long countWalked = 0;
+				for (it.seekToFirst(); it.isValid(); it.next())
+					countWalked++;
+				return countWalked;
+			}
+		}
+
+		@Override
+		public long getSizeApproximation() {
+			try {
+				return table.getKeyNumbers();
+			} catch (RocksDBException e) {
+				Task.forceThrow(e);
+				return 0; // never run here
+			}
+		}
+
+		@Override
 		public long walk(TableWalkHandleRaw callback) {
 			try (var it = table.iterator()) {
 				long countWalked = 0;

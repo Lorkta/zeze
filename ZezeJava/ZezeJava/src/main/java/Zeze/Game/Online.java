@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import Zeze.AppBase;
@@ -54,6 +55,7 @@ import Zeze.Serialize.Serializable;
 import Zeze.Transaction.Bean;
 import Zeze.Transaction.DispatchMode;
 import Zeze.Transaction.Procedure;
+import Zeze.Transaction.TableDynamic;
 import Zeze.Transaction.TableWalkHandle;
 import Zeze.Transaction.Transaction;
 import Zeze.Transaction.TransactionLevel;
@@ -71,6 +73,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+
 
 public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory {
 	protected static final Logger logger = LogManager.getLogger(Online.class);
@@ -94,6 +97,8 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 	private boolean freshStopModuleDynamic = false;
 	private volatile long localActiveTimeout = 600 * 1000; // 活跃时间超时。
 	private volatile long localCheckPeriod = 600 * 1000; // 检查间隔
+	private TableDynamic<Long, BLocal> _tlocal;
+	private final AtomicInteger verifyLocalCount = new AtomicInteger();
 
 	public ProviderApp getProviderApp() {
 		return providerApp;
@@ -176,7 +181,7 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 	public void upgrade(Function<Bean, Bean> retreatFunc) {
 		// 如果需要，重建_tlocal内存表的用户设置的bean。
 		var retreats = new ArrayList<Retreat>();
-		_tlocal.walkMemory((roleId, locals) -> {
+		_tlocal.walk((roleId, locals) -> {
 			for (var data : locals.getDatas()) {
 				var retreatBean = retreatFunc.apply(data.getValue().getAny().getBean());
 				if (retreatBean != null) {
@@ -313,6 +318,11 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 	}
 
 	public void start() {
+		var localTableName = "Zeze_Game_Online_Local_"
+				+ getOnlineSetName().replaceAll("\\.", "_")
+				+ "_" + providerApp.zeze.getConfig().getServerId();
+		_tlocal = new TableDynamic<>(providerApp.zeze, localTableName, _tlocalTempalte);
+
 		// default online 负责启动所有的online set。
 		if (defaultInstance == this) {
 			providerApp.builtinModules.put(this.getFullName(), this);
@@ -327,6 +337,85 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 			hotManager.addHotUpgrade(this);
 			hotManager.addHotBeanFactory(this);
 			beanFactory.registerWatch(this::tryRecordHotModule);
+		}
+	}
+
+	private boolean processOffline(Long roleId, @NotNull BLocal local, boolean serverStart) {
+		providerApp.zeze.newProcedure(
+				() -> procedureOffline(roleId, local, serverStart),
+				"procedureOffline").call();
+		return true; // continue walk
+	}
+
+	private long procedureOffline(Long roleId, @NotNull BLocal local, boolean serverStart) throws Exception {
+		var online = getOrAddOnline(roleId);
+		var account = online.getAccount();
+
+		// 本机数据已经过时，马上删除。
+		if (local.getLoginVersion() != online.getLoginVersion()) {
+			var ret = removeLocalAndTrigger(roleId, !serverStart);
+			if (ret != 0) {
+				logger.info("processOffline({}): account={}, roleId={}, removeLocalAndTrigger={}",
+						multiInstanceName, account, roleId, ret);
+				return ret;
+			}
+		}
+
+		// skip not owner: 仅仅检查LinkSid是不充分的。后面继续检查LoginVersion。
+		var link = online.getLink();
+		// local 里面的Link的State没有意义。
+		var linkName = local.getLink().getLinkName();
+		var linkSid = local.getLink().getLinkSid();
+		if (!link.getLinkName().equals(linkName) || link.getLinkSid() != linkSid) {
+			logger.info("processOffline({}): account={}, roleId={}, linkName={}, linkSid={} != linkName={}, linkSid={}",
+					multiInstanceName, account, roleId, linkName, linkSid, link.getLinkName(), link.getLinkSid());
+			return 0;
+		}
+
+		online.setLink(new BLink(link.getLinkName(), link.getLinkSid(), eLinkBroken));
+		// local 在这个流程里面不需要setLink，如果是这个登录的，那么扇面已经删除（removeLocalAndTrigger），否则不需要修改。
+
+		var ret = linkBrokenTrigger(account, roleId);
+		// for shorter use
+		logger.info("processOffline({}): account={}, roleId={}, linkName={}, linkSid={}, triggerEmbed={}",
+				multiInstanceName, account, roleId, linkName, linkSid, ret);
+
+		// see tryLogout
+		// 如果玩家在延迟期间建立了新的登录，下面版本号判断会失败。
+		if (online.getLink().getState() != eOffline && assignLogoutVersion(online)) {
+			var ret2 = logoutTrigger(roleId, LogoutReason.LOGOUT);
+			logger.info("processOffline: roleId={}, state={}, logoutTrigger={}",
+					roleId, online.getLink().getState(), ret2);
+			return ret2;
+		}
+		logger.info("processOffline: roleId={}, state={}, version.login/logoutVersion={}",
+				roleId, online.getLink().getState(), online.getLoginVersion());
+		return 0;
+	}
+
+	/**
+	 * 启动过程自动调用。
+	 */
+	public void startAfter() {
+		// default online 负责所有的online set。
+		if (defaultInstance == this) {
+			getProviderWithOnline().foreachOnline(online -> {
+				online._tlocal.walk((roleId, local) -> processOffline(roleId, local, true));
+			});
+		}
+	}
+
+	/**
+	 * 应用在开始停机前主动调用。
+	 * 此时应用还是完整的环境。
+	 */
+	public void stopBefore() {
+		// default online 负责所有的online set。
+		if (defaultInstance == this) {
+			providerApp.providerService.setDisableChoiceFromLinks(true);
+			getProviderWithOnline().foreachOnline(online -> {
+				online._tlocal.walk((roleId, local) -> processOffline(roleId, local, false));
+			});
 		}
 	}
 
@@ -397,11 +486,19 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 	}
 
 	public int getLocalCount() {
-		return _tlocal.getCacheSize();
+		return verifyLocalCount.get();
+	}
+
+	public int getLocalDatabaseSize() {
+		return (int)_tlocal.getDatabaseSize();
+	}
+
+	public int getLocalDatabaseSizeApproximation() {
+		return (int)_tlocal.getDatabaseSizeApproximation();
 	}
 
 	public long walkLocal(@NotNull TableWalkHandle<Long, BLocal> walker) {
-		return _tlocal.walkMemory(walker);
+		return _tlocal.walk(walker);
 	}
 
 	public long getLoginTimes() {
@@ -508,6 +605,10 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 	}
 
 	private long removeLocalAndTrigger(long roleId) throws Exception {
+		return removeLocalAndTrigger(roleId, false);
+	}
+
+	private long removeLocalAndTrigger(long roleId, boolean notVerifyCount) throws Exception {
 		var arg = new LocalRemoveEventArgument();
 		arg.roleId = roleId;
 		arg.local = _tlocal.get(roleId);
@@ -515,6 +616,8 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 		// local 没有数据不触发事件？
 		if (null != arg.local) {
 			_tlocal.remove(roleId); // remove first
+			if (!notVerifyCount)
+				Transaction.whileCommit(verifyLocalCount::decrementAndGet);
 			Transaction.whileCommit(() -> removeLocalActiveTime(roleId));
 
 			var ret = localRemoveEvents.triggerEmbed(this, arg);
@@ -586,6 +689,7 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 		var online = getOrAddOnline(roleId);
 		var link = online.getLink();
 		online.setLink(new BLink(link.getLinkName(), link.getLinkSid(), eOffline));
+		// local 在这个流程里面不需要setLink，如果是这个登录的，那么扇面已经删除（removeLocalAndTrigger），否则不需要修改。
 
 		// 总是尝试通知上一次登录的服务器，里面会忽略本机。
 		tryRedirectRemoveLocal(multiInstanceName, online.getServerId(), roleId);
@@ -728,6 +832,8 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 		}
 
 		online.setLink(new BLink(link.getLinkName(), link.getLinkSid(), eLinkBroken));
+		// local 在这个流程里面不需要setLink，如果是这个登录的，那么扇面已经删除（removeLocalAndTrigger），否则不需要修改。
+
 		var ret = linkBrokenTrigger(account, roleId);
 		// for shorter use
 		logger.info("sendError({}): account={}, roleId={}, linkName={}, linkSid={}, triggerEmbed={}",
@@ -776,6 +882,7 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 		}
 
 		online.setLink(new BLink(link.getLinkName(), link.getLinkSid(), eLinkBroken));
+		// local 在这个流程里面不需要setLink，如果是这个登录的，那么扇面已经删除（removeLocalAndTrigger），否则不需要修改。
 
 		var ret = linkBrokenTrigger(account, roleId);
 		// for shorter use
@@ -1631,11 +1738,20 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 
 	class VerifyBatch {
 		final ArrayList<Long> roleIds = new ArrayList<>();
+		private int walkCount;
+		private int removeCount;
+
+		public int getRemainCount() {
+			return walkCount - removeCount;
+		}
 
 		public boolean add(long roleId) {
+			++ walkCount;
 			var aTime = localActiveTimes.get(roleId);
-			if (null != aTime && System.currentTimeMillis() - aTime > localActiveTimeout)
+			if (null != aTime && System.currentTimeMillis() - aTime > localActiveTimeout) {
 				roleIds.add(roleId);
+				++ removeCount;
+			}
 			return true;
 		}
 
@@ -1650,7 +1766,7 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 				try {
 					providerApp.zeze.newProcedure(() -> {
 						for (var roleId : roleIds)
-							tryRemoveLocal(roleId);
+							tryRemoveLocal(roleId, true);
 						return 0L;
 					}, "Online.verifyLocal:" + roleIds).call();
 					sendDirect(roleIds, CheckLinkSession.TypeId_, new Binary(new CheckLinkSession().encode()), true);
@@ -1665,23 +1781,24 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 	private void verifyLocal() {
 		var batch = new VerifyBatch();
 		// 锁外执行事务
-		_tlocal.walkMemory((k, v) -> {
+		_tlocal.walk((k, v) -> {
 			batch.add(k);
 			batch.tryPerform();
 			return true;
 		});
 		batch.perform();
+		verifyLocalCount.set(batch.getRemainCount());
 		startLocalCheck();
 	}
 
-	private long tryRemoveLocal(long roleId) throws Exception {
+	private long tryRemoveLocal(long roleId, boolean notVerifyCount) throws Exception {
 		var local = _tlocal.get(roleId);
 		if (null == local)
 			return 0;
 
 		var online = getOnline(roleId);
 		if (online == null || online.getLink().getState() == eOffline || online.getLoginVersion() != local.getLoginVersion())
-			return removeLocalAndTrigger(roleId);
+			return removeLocalAndTrigger(roleId, notVerifyCount);
 		return 0;
 	}
 
@@ -1692,7 +1809,8 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 			// 能收到redirect的肯定是defaultOnline，这里为了保险期间和代码更清楚，直接使用defaultInstance。
 			var onlineSet = defaultInstance.getOnline(instanceName);
 			if (null != onlineSet)
-				providerApp.zeze.newProcedure(() -> onlineSet.tryRemoveLocal(roleId), "Online.redirectRemoveLocal").call();
+				providerApp.zeze.newProcedure(() -> onlineSet.tryRemoveLocal(roleId, false),
+						"Online.redirectRemoveLocal").call();
 		}
 	}
 
@@ -1740,8 +1858,11 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 			dispatch.Argument.setOnlineSetName(multiInstanceName); // 这里需要设置OnlineSetName,因为link此时还无法设置
 		var roleId = rpc.Argument.getRoleId();
 		var online = getOrAddOnline(roleId);
-		var local = _tlocal.getOrAdd(roleId);
+		var isAdd = new OutObject<>(false);
+		var local = _tlocal.getOrAdd(roleId, isAdd);
 		Transaction.whileCommit(() -> putLocalActiveTime(roleId));
+		if (isAdd.value)
+			Transaction.whileCommit(verifyLocalCount::incrementAndGet);
 		var link = online.getLink();
 
 		var onlineAccount = online.getAccount();
@@ -1769,7 +1890,9 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 		var loginVersion = online.getLoginVersion() + 1;
 		local.setLoginVersion(loginVersion);
 		online.setLoginVersion(loginVersion);
-		online.setLink(new BLink(session.getLinkName(), session.getLinkSid(), eLogined));
+		var bLink = new BLink(session.getLinkName(), session.getLinkSid(), eLogined);
+		online.setLink(bLink);
+		local.setLink(bLink);
 
 		Transaction.whileCommit(() -> {
 			var setUserState = new SetUserState();
@@ -1827,8 +1950,11 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 			dispatch.Argument.setOnlineSetName(multiInstanceName); // 这里需要设置OnlineSetName,因为link此时还无法设置
 		var roleId = rpc.Argument.getRoleId();
 		var online = getOrAddOnline(roleId);
-		var local = _tlocal.getOrAdd(roleId);
+		var isAdd = new OutObject<>(false);
+		var local = _tlocal.getOrAdd(roleId, isAdd);
 		Transaction.whileCommit(() -> putLocalActiveTime(roleId));
+		if (isAdd.value)
+			Transaction.whileCommit(verifyLocalCount::incrementAndGet);
 		var link = online.getLink();
 
 		var onlineAccount = online.getAccount();
@@ -1856,7 +1982,9 @@ public class Online extends AbstractOnline implements HotUpgrade, HotBeanFactory
 		var loginVersion = online.getLoginVersion() + 1;
 		local.setLoginVersion(loginVersion);
 		online.setLoginVersion(loginVersion);
-		online.setLink(new BLink(session.getLinkName(), session.getLinkSid(), eLogined));
+		var bLink = new BLink(session.getLinkName(), session.getLinkSid(), eLogined);
+		online.setLink(bLink);
+		local.setLink(bLink);
 
 		Transaction.whileCommit(() -> {
 			var setUserState = new SetUserState();

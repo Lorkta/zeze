@@ -285,7 +285,15 @@ public abstract class Database {
 		void close();
 
 		default void clear() {
-			// rocksdb支持；
+			throw new UnsupportedOperationException();
+		}
+
+		default long getSize() {
+			throw new UnsupportedOperationException();
+		}
+
+		default long getSizeApproximation() {
+			throw new UnsupportedOperationException();
 		}
 	}
 

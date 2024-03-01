@@ -13,6 +13,7 @@ import Zeze.Services.GlobalCacheManager.Reduce;
 import Zeze.Services.GlobalCacheManagerConst;
 import Zeze.Services.ServiceManager.AutoKey;
 import Zeze.Util.KV;
+import Zeze.Util.OutObject;
 import Zeze.Util.PerfCounter;
 import Zeze.Util.Random;
 import org.apache.logging.log4j.LogManager;
@@ -482,7 +483,6 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 		cache.getDataMap().entrySet().parallelStream().forEach((e) -> {
 			var k = e.getKey();
 			var v = e.getValue();
-			//noinspection DataFlowIssue
 			if (globalAgent.getGlobalCacheManagerHashIndex(encodeGlobalKey(k)) == GlobalCacheManagerHashIndex) {
 				var lockey = locks.get(new TableKey(getId(), k));
 				if (lockey.tryEnterWriteLock(0)) {
@@ -583,6 +583,10 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 	}
 
 	public final @NotNull V getOrAdd(@NotNull K key) {
+		return getOrAdd(key, null);
+	}
+
+	public final @NotNull V getOrAdd(@NotNull K key, @Nullable OutObject<Boolean> isAdd) {
 		var currentT = Transaction.getCurrent();
 		assert currentT != null;
 		//noinspection ConstantValue
@@ -606,7 +610,8 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 				return v;
 			// add
 		}
-
+		if (null != isAdd)
+			isAdd.value = true;
 		V add = newValue();
 		add.initRootInfo(cr.atomicTupleRecord.record.createRootInfoIfNeed(tkey), null);
 		cr.put(currentT, add);
@@ -776,6 +781,20 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 
 	public final @NotNull V decodeValue(byte @NotNull [] bytes) {
 		return decodeValue(ByteBuffer.Wrap(bytes));
+	}
+
+	public long getDatabaseSize() {
+		var storage = this.storage;
+		if (storage == null)
+			throw new IllegalStateException("storage is in-memory or closed");
+		return storage.getDatabaseTable().getSize();
+	}
+
+	public long getDatabaseSizeApproximation() {
+		var storage = this.storage;
+		if (storage == null)
+			throw new IllegalStateException("storage is in-memory or closed");
+		return storage.getDatabaseTable().getSizeApproximation();
 	}
 
 	public final K walk(@Nullable K exclusiveStartKey, int proposeLimit, @NotNull TableWalkHandle<K, V> callback) {

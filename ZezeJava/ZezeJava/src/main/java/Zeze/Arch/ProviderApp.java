@@ -5,6 +5,7 @@ import java.util.Map;
 import Zeze.Application;
 import Zeze.Builtin.Provider.BLoad;
 import Zeze.Builtin.Provider.BModule;
+import Zeze.Game.ProviderWithOnline;
 import Zeze.IModule;
 import Zeze.Services.ServiceManager.BSubscribeInfo;
 import Zeze.Util.IntHashMap;
@@ -38,6 +39,16 @@ public class ProviderApp {
 	public final IntHashMap<BModule.Data> modules = new IntHashMap<>();
 	public final HashMap<String, IModule> builtinModules = new HashMap<>();
 	private boolean startLast;
+	private boolean isOnlineReady = false;
+	private boolean isUserDisableChoice = true;
+
+	public boolean isOnlineReady() {
+		return isOnlineReady;
+	}
+
+	public boolean isUserDisableChoice() {
+		return isUserDisableChoice;
+	}
 
 	public boolean isStartLast() {
 		return startLast;
@@ -149,13 +160,28 @@ public class ProviderApp {
 		}
 	}
 
-	public void startLast(@NotNull ProviderModuleBinds binds, @NotNull Map<String, IModule> modules) throws Exception {
+	void setUserDisableChoice(boolean userDisableChoice) {
+		isUserDisableChoice = userDisableChoice;
+	}
+
+	public synchronized void startLast(@NotNull ProviderModuleBinds binds, @NotNull Map<String, IModule> modules) throws Exception {
 		buildProviderModuleBinds(binds, modules);
 		providerImplement.registerModulesAndSubscribeLinkd();
-		synchronized (this) {
-			startLast = true;
-		}
+		startLast = true;
 		zeze.getTimer().start();
 		zeze.getAppBase().startLastModules();
+
+		if (providerImplement instanceof ProviderWithOnline) {
+			var game = (ProviderWithOnline)providerImplement;
+			game.getOnline().startAfter();
+		}
+		// 这个应该在Online.Start里面设置更合理。
+		// 但是Online有多个版本，而且跨包设置需要方法，就这里直接设置了。
+		// 是启动流程的一部分。
+		isOnlineReady = true;
+
+		// 开启link，默认开启。
+		setUserDisableChoice(false);
+		providerService.trySetLinkChoice();
 	}
 }
