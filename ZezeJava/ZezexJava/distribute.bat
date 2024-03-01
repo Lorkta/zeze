@@ -5,13 +5,17 @@ pushd %~dp0
 rd /s /q server\hot 2>nul
 mkdir server\hot\distributes
 
-rem ±ØÐëcdµ½Æô¶¯Ä¿Â¼Ö´ÐÐ£¬ÅäÖÃÄ¿Â¼ÓÐÒÀÀµ¡£
+rem ï¿½ï¿½ï¿½ï¿½cdï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¿Â¼Ö´ï¿½Ð£ï¿½ï¿½ï¿½ï¿½ï¿½Ä¿Â¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 cd server
 
 set classes=../../ZezeJava/build/classes/java/main;build/classes/java/main
 
-echo ´ò°ü...
-java -cp %classes%;../../ZezeJava/lib/* Zeze.Hot.Distribute -privateBean -app Game.App -workingDir hot -classes  build/classes/java/main -providerModuleBinds ../provider.module.binds.xml -config server.xml
+set JAVA_HOME=C:/Users/guoqing.ma/.jdks/openjdk-21.0.2/
+@rem %JAVA_HOME:"=%
+set JAVA_EXE=%JAVA_HOME%/bin/java.exe
+
+echo ï¿½ï¿½ï¿½...
+"%JAVA_EXE%" -cp %classes%;../../ZezeJava/lib/* Zeze.Hot.Distribute -privateBean -app Game.App -workingDir hot -classes  build/classes/java/main -providerModuleBinds ../provider.module.binds.xml -config server.xml
 echo OK
 
 cd ..
