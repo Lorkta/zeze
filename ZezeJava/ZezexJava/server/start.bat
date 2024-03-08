@@ -3,14 +3,14 @@
 setlocal
 pushd %~dp0
 
-if not exist hot (
-	cd ..
-	call distribute.bat
-	cd server
-)
-if not exist hot run (
-	move hot hotrun
-)
+@rem if not exist hot (
+@rem	cd ..
+@rem	call distribute.bat
+@rem	cd server
+@rem )
+@rem if not exist hot run (
+@rem	move hot hotrun
+@rem )
 
 set JAVA_HOME=C:/Users/guoqing.ma/.jdks/openjdk-21.0.2/
 @rem %JAVA_HOME:"=%
@@ -23,7 +23,7 @@ set zeze_classes=../../ZezeJava/build/classes/java/main;../../ZezeJava/build/res
 @rem start "server"
 
 set linkd_classes=%zeze_classes%;../linkd/build/classes/java/main
-start "linkd" "%JAVA_EXE%" -cp %linkd_classes%;../../ZezeJavaTest/lib/jgrapht-core-1.5.2.jar;../../ZezeJava/lib/* Program
+"%JAVA_EXE%" -cp %linkd_classes%;../../ZezeJavaTest/lib/jgrapht-core-1.5.2.jar;../../ZezeJava/lib/* Program
 
 @rem timeout 10
 @rem set client_classes=%zeze_classes%;../client/build/classes/java/main
