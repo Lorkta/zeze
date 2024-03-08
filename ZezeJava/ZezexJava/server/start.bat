@@ -18,7 +18,7 @@ set JAVA_EXE=%JAVA_HOME%/bin/java.exe
 
 set zeze_classes=../../ZezeJava/build/classes/java/main;../../ZezeJava/build/resources/main
 
-"%JAVA_EXE%" -cp %zeze_classes%;./hotrun/server.jar;../../ZezeJavaTest/lib/jgrapht-core-1.5.2.jar;../../ZezeJava/lib/* Program
+start "server" java -cp %zeze_classes%;./hotrun/server.jar;../../ZezeJavaTest/lib/* Program
 
 @rem start "server"
 

@@ -15,7 +15,7 @@ set JAVA_HOME=C:/Users/guoqing.ma/.jdks/openjdk-21.0.2/
 set JAVA_EXE=%JAVA_HOME%/bin/java.exe
 
 echo ���...
-"%JAVA_EXE%" -cp %classes%;../../ZezeJava/lib/* Zeze.Hot.Distribute -privateBean -app Game.App -workingDir hot -classes  build/classes/java/main -providerModuleBinds ../provider.module.binds.xml -config server.xml
+java -cp %classes%;../../ZezeJavaTest/lib/* Zeze.Hot.Distribute -privateBean -app Game.App -workingDir hot -classes  build/classes/java/main -providerModuleBinds ../provider.module.binds.xml -config server.xml
 echo OK
 
 cd ..
