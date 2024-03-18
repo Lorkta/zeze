@@ -869,7 +869,7 @@ public class Schemas implements Serializable {
 
 		@Override
 		public @NotNull String toString() {
-			return name + ':' + variableId;
+			return name + ':' + variableId + ":" + sqlType;
 		}
 
 		public Column(@NotNull String name, int @NotNull [] varIds, @NotNull Variable variable,
@@ -899,6 +899,14 @@ public class Schemas implements Serializable {
 		public final ArrayList<Column> change = new ArrayList<>();
 		public final ArrayList<Column> add = new ArrayList<>();
 		public final ArrayList<Column> remove = new ArrayList<>();
+
+		@Override
+		public String toString() {
+			return tableName +
+					" add:" + add +
+					" change:" + change +
+					" remove:" + remove;
+		}
 
 		public RelationalTable(@NotNull String name) {
 			tableName = name;
@@ -1040,10 +1048,13 @@ public class Schemas implements Serializable {
 
 		// build other. prepare to alter.
 		// is null if new table
+		logger.info("current.columns={}", relational.current);
 		if (null != other) {
 			other.buildRelationalColumns(relational.previous);
+			logger.info("previous.columns={}", relational.previous);
 			relational.diff();
 		}
+		logger.info("current={}", relational);
 		return relational;
 	}
 
@@ -1059,5 +1070,6 @@ public class Schemas implements Serializable {
 				}
 			}
 		}
+		//logger.info("relationalTables: {}", relationalTables);
 	}
 }
