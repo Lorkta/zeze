@@ -190,8 +190,6 @@ public final class App extends Zeze.AppBase {
     public Game.Map.ModuleMap Game_Map;
     public Game.Rank.ModuleRank Game_Rank;
 
-	public Game.Login.ModuleLogin Game_Login;
-
     @Override
     public Zeze.Application getZeze() {
         return Zeze;
@@ -223,7 +221,6 @@ public final class App extends Zeze.AppBase {
         var _modules_ = createRedirectModules(new Class[] {
             Game.Map.ModuleMap.class,
             Game.Rank.ModuleRank.class,
-			Game.Login.ModuleLogin.class,
         });
         if (_modules_ == null)
             return;
@@ -238,19 +235,12 @@ public final class App extends Zeze.AppBase {
         if (modules.put(Game_Rank.getFullName(), Game_Rank) != null)
             throw new IllegalStateException("duplicate module name: Game_Rank");
 
-		Game_Login = (Game.Login.ModuleLogin)_modules_[2];
-		Game_Login.Initialize(this);
-		if (modules.put(Game_Login.getFullName(), Game_Login) != null)
-			throw new IllegalStateException("duplicate module name: Game_Login");
-
         Zeze.setSchemas(new Game.Schemas());
     }
 
     public synchronized void destroyModules() throws Exception {
         Game_Rank = null;
         Game_Map = null;
-		Game_Login = null;
-
         if (null != Zeze.getHotManager()) {
             Zeze.getHotManager().destroyModules();
             Zeze.setHotManager(null);
@@ -270,8 +260,6 @@ public final class App extends Zeze.AppBase {
     public synchronized void startModules() throws Exception {
         Game_Map.Start(this);
         Game_Rank.Start(this);
-		Game_Login.Start(this);
-
         if (null != Zeze.getHotManager()) {
             var definedOrder = new java.util.HashSet<String>();
             Zeze.getHotManager().startModulesExcept(definedOrder);
