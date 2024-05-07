@@ -5,12 +5,14 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Application;
 import Zeze.Config.DatabaseConf;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Serialize.IByteBuffer;
 import Zeze.Serialize.Serializable;
 import Zeze.Util.KV;
+import Zeze.Util.OutInt;
 import Zeze.Util.ShutdownHook;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -23,7 +25,7 @@ import static Zeze.Services.GlobalCacheManagerConst.StateShare;
  * 数据访问的效率主要来自TableCache的命中。根据以往的经验，命中率是很高的。
  * 所以数据库层就不要求很高的效率。马马虎虎就可以了。
  */
-public abstract class Database {
+public abstract class Database extends ReentrantLock {
 	protected static final Logger logger = LogManager.getLogger(Database.class);
 
 	// 当数据库对Key长度有限制时，使用这个常量。这个数字来自 PolarDb-X。其中MySql 8是3072.
@@ -117,13 +119,16 @@ public abstract class Database {
 	public final void open(@NotNull Application app) {
 		var ts = tables.values().toArray(new Zeze.Transaction.Table[tables.size()]);
 		var names = new String[ts.length];
-		int i = 0;
-		for (var table : ts)
-			names[i++] = table.getName();
-		var localTables = app.getLocalRocksCacheDb().openTables(names);
-		i = 0;
-		for (var table : ts) {
-			var storage = table.open(app, this, localTables[i++]);
+		var ids = new int[ts.length];
+		for (var i = 0; i < ts.length; ++i) {
+			var table = ts[i];
+			names[i] = table.getName();
+			ids[i] = table.getId();
+		}
+		var localTables = app.getLocalRocksCacheDb().openTables(names, ids);
+		for (var i = 0; i < ts.length; ++i) {
+			var table = ts[i];
+			var storage = table.open(app, this, localTables[i]);
 			if (storage != null)
 				storages.add(storage);
 		}
@@ -179,12 +184,14 @@ public abstract class Database {
 			storage.cleanup();
 	}
 
-	public abstract @NotNull Table openTable(@NotNull String name);
+	public abstract @NotNull Table openTable(@NotNull String name, int id);
 
-	public @NotNull Table @NotNull [] openTables(String @NotNull [] names) {
+	public @NotNull Table @NotNull [] openTables(String @NotNull [] names, int @NotNull [] ids) {
+		if (names.length != ids.length)
+			throw new RuntimeException("tables name & id count mismatch.");
 		var tables = new Table[names.length];
 		for (int i = 0, n = names.length; i < n; i++)
-			tables[i] = openTable(names[i]);
+			tables[i] = openTable(names[i], ids[i]);
 		return tables;
 	}
 
@@ -192,12 +199,6 @@ public abstract class Database {
 		if (bb.limit() == bb.capacity() && bb.arrayOffset() == 0)
 			return bb.array();
 		return Arrays.copyOfRange(bb.array(), bb.arrayOffset(), bb.limit());
-	}
-
-	public static byte @NotNull [] copyIf(@NotNull ByteBuffer bb) {
-		if (bb.ReadIndex == 0 && bb.WriteIndex == bb.capacity())
-			return bb.Bytes;
-		return Arrays.copyOfRange(bb.Bytes, bb.ReadIndex, bb.WriteIndex);
 	}
 
 	public static byte @NotNull [] copyIf(byte @NotNull [] bytes, int offset, int len) {
@@ -212,6 +213,10 @@ public abstract class Database {
 		void waitReady();
 
 		@NotNull Database getDatabase();
+
+		default int keyOffsetInRawKey() {
+			return 0;
+		}
 
 		///////////////////////////////////////////////////////////
 		// TableX类型下沉到这里，准备添加关系表映射。
@@ -324,17 +329,17 @@ public abstract class Database {
 
 		public abstract long walkKeyDesc(@NotNull TableWalkKeyRaw callback);
 
-		public abstract ByteBuffer walk(@Nullable ByteBuffer exclusiveStartKey, int proposeLimit,
-										@NotNull TableWalkHandleRaw callback);
+		public abstract @Nullable ByteBuffer walk(@Nullable ByteBuffer exclusiveStartKey, int proposeLimit,
+												  @NotNull TableWalkHandleRaw callback);
 
-		public abstract ByteBuffer walkKey(@Nullable ByteBuffer exclusiveStartKey, int proposeLimit,
-										   @NotNull TableWalkKeyRaw callback);
+		public abstract @Nullable ByteBuffer walkKey(@Nullable ByteBuffer exclusiveStartKey, int proposeLimit,
+													 @NotNull TableWalkKeyRaw callback);
 
-		public abstract ByteBuffer walkDesc(@Nullable ByteBuffer exclusiveStartKey, int proposeLimit,
-											@NotNull TableWalkHandleRaw callback);
+		public abstract @Nullable ByteBuffer walkDesc(@Nullable ByteBuffer exclusiveStartKey, int proposeLimit,
+													  @NotNull TableWalkHandleRaw callback);
 
-		public abstract ByteBuffer walkKeyDesc(@Nullable ByteBuffer exclusiveStartKey, int proposeLimit,
-											   @NotNull TableWalkKeyRaw callback);
+		public abstract @Nullable ByteBuffer walkKeyDesc(@Nullable ByteBuffer exclusiveStartKey, int proposeLimit,
+														 @NotNull TableWalkKeyRaw callback);
 
 		@Override
 		public <K extends Comparable<K>, V extends Bean> V find(@NotNull TableX<K, V> table, @NotNull Object key) {
@@ -365,7 +370,7 @@ public abstract class Database {
 
 		private static <K extends Comparable<K>, V extends Bean>
 		boolean invokeCallback(TableX<K, V> table, byte[] key, byte[] value, TableWalkHandle<K, V> callback) {
-			K k = table.decodeKey(ByteBuffer.Wrap(key));
+			K k = table.decodeKey(key);
 			V v = null;
 			var r = table.getCache().get(k);
 			if (r != null) {
@@ -384,12 +389,12 @@ public abstract class Database {
 				// 继续后面的处理：使用数据库中的数据。
 			}
 			// cache中有数据，使用最新的数据; 缓存中不存在或者正在被删除但还没提交，使用数据库中的数据。
-			return callback.handle(k, v != null ? v : table.decodeValue(ByteBuffer.Wrap(value)));
+			return callback.handle(k, v != null ? v : table.decodeValue(value));
 		}
 
 		private static <K extends Comparable<K>, V extends Bean>
 		boolean invokeCallback(TableX<K, V> table, byte[] key, TableWalkKey<K> callback) {
-			K k = table.decodeKey(ByteBuffer.Wrap(key));
+			K k = table.decodeKey(key);
 			var r = table.getCache().get(k);
 			if (r != null) {
 				r.enterFairLock();
@@ -501,8 +506,8 @@ public abstract class Database {
 		public <K extends Comparable<K>, V extends Bean>
 		long walkDatabase(TableX<K, V> table, TableWalkHandle<K, V> callback) {
 			return walk((key, value) -> {
-				K k = table.decodeKey(ByteBuffer.Wrap(key));
-				V v = table.decodeValue(ByteBuffer.Wrap(value));
+				K k = table.decodeKey(key);
+				V v = table.decodeValue(value);
 				return callback.handle(k, v);
 			});
 		}
@@ -511,8 +516,8 @@ public abstract class Database {
 		public <K extends Comparable<K>, V extends Bean>
 		long walkDatabaseDesc(TableX<K, V> table, TableWalkHandle<K, V> callback) {
 			return walkDesc((key, value) -> {
-				K k = table.decodeKey(ByteBuffer.Wrap(key));
-				V v = table.decodeValue(ByteBuffer.Wrap(value));
+				K k = table.decodeKey(key);
+				V v = table.decodeValue(value);
 				return callback.handle(k, v);
 			});
 		}
@@ -520,13 +525,13 @@ public abstract class Database {
 		@Override
 		public <K extends Comparable<K>, V extends Bean>
 		long walkDatabaseKey(TableX<K, V> table, TableWalkKey<K> callback) {
-			return walkKey(key -> callback.handle(table.decodeKey(ByteBuffer.Wrap(key))));
+			return walkKey(key -> callback.handle(table.decodeKey(key)));
 		}
 
 		@Override
 		public <K extends Comparable<K>, V extends Bean>
 		long walkDatabaseKeyDesc(TableX<K, V> table, TableWalkKey<K> callback) {
-			return walkKeyDesc(key -> callback.handle(table.decodeKey(ByteBuffer.Wrap(key))));
+			return walkKeyDesc(key -> callback.handle(table.decodeKey(key)));
 		}
 
 		@Override
@@ -534,8 +539,8 @@ public abstract class Database {
 		K walkDatabase(TableX<K, V> table, K exclusiveStartKey, int proposeLimit, TableWalkHandle<K, V> callback) {
 			var encodedExclusiveStartKey = exclusiveStartKey != null ? table.encodeKey(exclusiveStartKey) : null;
 			var lastKey = walk(encodedExclusiveStartKey, proposeLimit, (key, value) -> {
-				K k = table.decodeKey(ByteBuffer.Wrap(key));
-				V v = table.decodeValue(ByteBuffer.Wrap(value));
+				K k = table.decodeKey(key);
+				V v = table.decodeValue(value);
 				return callback.handle(k, v);
 			});
 			return lastKey != null ? table.decodeKey(lastKey) : null;
@@ -547,8 +552,8 @@ public abstract class Database {
 						   TableWalkHandle<K, V> callback) {
 			var encodedExclusiveStartKey = exclusiveStartKey != null ? table.encodeKey(exclusiveStartKey) : null;
 			var lastKey = walkDesc(encodedExclusiveStartKey, proposeLimit, (key, value) -> {
-				K k = table.decodeKey(ByteBuffer.Wrap(key));
-				V v = table.decodeValue(ByteBuffer.Wrap(value));
+				K k = table.decodeKey(key);
+				V v = table.decodeValue(value);
 				return callback.handle(k, v);
 			});
 			return lastKey != null ? table.decodeKey(lastKey) : null;
@@ -559,7 +564,7 @@ public abstract class Database {
 		K walkDatabaseKey(TableX<K, V> table, K exclusiveStartKey, int proposeLimit, TableWalkKey<K> callback) {
 			var encodedExclusiveStartKey = exclusiveStartKey != null ? table.encodeKey(exclusiveStartKey) : null;
 			var lastKey = walkKey(encodedExclusiveStartKey, proposeLimit,
-					key -> callback.handle(table.decodeKey(ByteBuffer.Wrap(key))));
+					key -> callback.handle(table.decodeKey(key)));
 			return lastKey != null ? table.decodeKey(lastKey) : null;
 		}
 
@@ -568,7 +573,7 @@ public abstract class Database {
 		K walkDatabaseKeyDesc(TableX<K, V> table, K exclusiveStartKey, int proposeLimit, TableWalkKey<K> callback) {
 			var encodedExclusiveStartKey = exclusiveStartKey != null ? table.encodeKey(exclusiveStartKey) : null;
 			var lastKey = walkKeyDesc(encodedExclusiveStartKey, proposeLimit,
-					key -> callback.handle(table.decodeKey(ByteBuffer.Wrap(key))));
+					key -> callback.handle(table.decodeKey(key)));
 			return lastKey != null ? table.decodeKey(lastKey) : null;
 		}
 	}
@@ -586,18 +591,18 @@ public abstract class Database {
 		public long version;
 
 		@Override
-		public void encode(ByteBuffer bb) {
+		public void encode(@NotNull ByteBuffer bb) {
 			bb.WriteByteBuffer(data);
 			bb.WriteLong(version);
 		}
 
 		@Override
-		public void decode(IByteBuffer bb) {
+		public void decode(@NotNull IByteBuffer bb) {
 			data = ByteBuffer.Wrap(bb.ReadBytes());
 			version = bb.ReadLong();
 		}
 
-		public static DataWithVersion decode(byte[] bytes) {
+		public static @NotNull DataWithVersion decode(byte @Nullable [] bytes) {
 			var dv = new DataWithVersion();
 			if (bytes != null)
 				dv.decode(ByteBuffer.Wrap(bytes));
@@ -634,9 +639,9 @@ public abstract class Database {
 		    commit;
 		    return true;
 		*/
-		void setInUse(int localId, String global);
+		void setInUse(int localId, @NotNull String global);
 
-		int clearInUse(int localId, String global);
+		int clearInUse(int localId, @NotNull String global);
 
 		/*
 		  if (Exist(key)) {
@@ -648,9 +653,10 @@ public abstract class Database {
 		  InsertData(data);
 		  return (CurrentVersion = version, true);
 		*/
-		KV<Long, Boolean> saveDataWithSameVersion(ByteBuffer key, ByteBuffer data, long version);
+		@Nullable KV<Long, Boolean> saveDataWithSameVersion(@NotNull ByteBuffer key, @NotNull ByteBuffer data,
+															long version);
 
-		DataWithVersion getDataWithVersion(ByteBuffer key);
+		@Nullable DataWithVersion getDataWithVersion(@NotNull ByteBuffer key);
 
 		// 只有mysql,dbh2实现这个。
 		default boolean tryLock() {
@@ -662,25 +668,60 @@ public abstract class Database {
 	}
 
 	public static class NullOperates implements Operates {
-
 		@Override
-		public void setInUse(int localId, String global) {
-
+		public void setInUse(int localId, @NotNull String global) {
 		}
 
 		@Override
-		public int clearInUse(int localId, String global) {
+		public int clearInUse(int localId, @NotNull String global) {
 			return 0;
 		}
 
 		@Override
-		public KV<Long, Boolean> saveDataWithSameVersion(ByteBuffer key, ByteBuffer data, long version) {
+		public @Nullable KV<Long, Boolean> saveDataWithSameVersion(@NotNull ByteBuffer key, @NotNull ByteBuffer data,
+																   long version) {
 			return KV.create(version, true);
 		}
 
 		@Override
-		public DataWithVersion getDataWithVersion(ByteBuffer key) {
+		public @Nullable DataWithVersion getDataWithVersion(@NotNull ByteBuffer key) {
 			return null;
+		}
+	}
+
+	public static final class ReentrantLockHelper {
+		private final ThreadLocal<OutInt> count = new ThreadLocal<>();
+
+		/**
+		 * lock
+		 *
+		 * @return false 表示第一次调用，此时需要执行真正的lock实现。
+		 */
+		public boolean tryLock() {
+			var c = count.get();
+			if (c != null && c.value > 0) {
+				c.value++;
+				return true;
+			}
+			return false;
+		}
+
+		public void lockSuccess() {
+			count.set(new OutInt(1));
+		}
+
+		/**
+		 * unlock
+		 *
+		 * @return true 计数达到0，可以执行真正的unlock实现。
+		 */
+		public boolean tryUnlock() {
+			var c = count.get();
+			return --c.value == 0;
+		}
+
+		public void unlockSuccess() {
+			count.remove();
 		}
 	}
 }

@@ -113,6 +113,11 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 		return oldTable;
 	}
 
+	public int keyOffsetInRawKey() {
+		var s = storage;
+		return s != null ? s.getDatabaseTable().keyOffsetInRawKey() : 0;
+	}
+
 	public boolean isUseRelationalMapping() {
 		return useRelationalMapping;
 	}
@@ -312,6 +317,8 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 				case StateRemoved: // impossible! safe only.
 				case StateInvalid:
 					rpc.Result.state = StateInvalid;
+					rpc.Result.reducedTid = r.getTid();
+					r.setTid(0);
 					rpc.setResultCode(GlobalCacheManagerConst.ReduceShareAlreadyIsInvalid);
 
 					if (r.getDirty())
@@ -323,6 +330,8 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 
 				case StateShare:
 					rpc.Result.state = StateShare;
+					rpc.Result.reducedTid = r.getTid();
+					r.setTid(0);
 					rpc.setResultCode(GlobalCacheManagerConst.ReduceShareAlreadyIsShare);
 					if (r.getDirty())
 						break;
@@ -334,6 +343,8 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 				case StateModify:
 					r.setState(StateShare); // 马上修改状态。事务如果要写会再次请求提升(Acquire)。
 					rpc.Result.state = StateShare;
+					rpc.Result.reducedTid = r.getTid();
+					r.setTid(0);
 					if (r.getDirty())
 						break;
 					if (isTraceEnabled)
@@ -419,6 +430,8 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 				case StateRemoved: // impossible! safe only.
 				case StateInvalid:
 					rpc.Result.state = StateInvalid;
+					rpc.Result.reducedTid = r.getTid();
+					r.setTid(0);
 					rpc.setResultCode(GlobalCacheManagerConst.ReduceInvalidAlreadyIsInvalid);
 					if (r.getDirty())
 						break;
@@ -429,6 +442,8 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 
 				case StateShare:
 					r.setState(StateInvalid);
+					rpc.Result.reducedTid = r.getTid();
+					r.setTid(0);
 					PerfCounter.instance.getOrAddTableInfo(getId()).reduceInvalid.increment();
 					// 不删除记录，让TableCache.CleanNow处理。
 					if (r.getDirty())
@@ -440,6 +455,8 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 
 				case StateModify:
 					r.setState(StateInvalid);
+					rpc.Result.reducedTid = r.getTid();
+					r.setTid(0);
 					PerfCounter.instance.getOrAddTableInfo(getId()).reduceInvalid.increment();
 					if (r.getDirty())
 						break;
@@ -708,8 +725,8 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 		relationalTable = getZeze().getSchemas().relationalTables.get(getName()); // maybe null
 		storage = isMemory() ? null : new Storage<>(this, database, getName());
 		oldTable = getTableConf().getDatabaseOldMode() == 1
-				? app.getDatabase(getTableConf().getDatabaseOldName()).openTable(getName()) : null;
-		localRocksCacheTable = localTable != null ? localTable : app.getLocalRocksCacheDb().openTable(getName());
+				? app.getDatabase(getTableConf().getDatabaseOldName()).openTable(getName(), getId()) : null;
+		localRocksCacheTable = localTable != null ? localTable : app.getLocalRocksCacheDb().openTable(getName(), getId());
 		useRelationalMapping = isRelationalMapping() && database instanceof DatabaseMySql;
 		return storage;
 	}
@@ -738,7 +755,8 @@ public abstract class TableX<K extends Comparable<K>, V extends Bean> extends Ta
 	}
 
 	public @NotNull K decodeKey(byte @NotNull [] bytes) {
-		return decodeKey(ByteBuffer.Wrap(bytes));
+		int keyOffset = keyOffsetInRawKey();
+		return decodeKey(ByteBuffer.Wrap(bytes, keyOffset, bytes.length - keyOffset));
 	}
 
 	@Override

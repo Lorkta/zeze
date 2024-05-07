@@ -11,6 +11,7 @@ import java.nio.channels.SelectionKey;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Serialize.IByteBuffer;
 import Zeze.Serialize.Serializable;
@@ -28,7 +29,7 @@ import org.apache.logging.log4j.Logger;
  * 2 处理乱序。
  * 3 没有流量控制。
  */
-public class ReliableUdp implements SelectorHandle, Closeable {
+public class ReliableUdp extends ReentrantLock implements SelectorHandle, Closeable {
 	private static final Logger logger = LogManager.getLogger(AsyncSocket.class);
 
 	public static final int TypePacket = 0;
@@ -341,14 +342,19 @@ public class ReliableUdp implements SelectorHandle, Closeable {
 	}
 
 	@Override
-	public synchronized void close() {
-		if (selectionKey == null)
-			return;
+	public void close() {
+		lock();
 		try {
-			selectionKey.channel().close();
-		} catch (IOException skip) {
-			logger.error("", skip);
+			if (selectionKey == null)
+				return;
+			try {
+				selectionKey.channel().close();
+			} catch (IOException skip) {
+				logger.error("", skip);
+			}
+			selectionKey = null;
+		} finally {
+			unlock();
 		}
-		selectionKey = null;
 	}
 }

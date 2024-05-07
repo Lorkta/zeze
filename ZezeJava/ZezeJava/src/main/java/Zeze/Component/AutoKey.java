@@ -4,6 +4,7 @@ import java.util.Base64;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Application;
 import Zeze.Builtin.AutoKey.BSeedKey;
 import Zeze.Net.Binary;
@@ -17,7 +18,7 @@ import Zeze.Util.Task;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-public class AutoKey {
+public class AutoKey extends ReentrantLock {
 	public static class Module extends AbstractAutoKey {
 		private final ConcurrentHashMap<String, AutoKey> map = new ConcurrentHashMap<>();
 		public final @NotNull Application zeze;
@@ -217,6 +218,7 @@ public class AutoKey {
 				return result.value;
 		} catch (InterruptedException | ExecutionException e) {
 			Task.forceThrow(e);
+			//noinspection UnreachableCode
 			return -1; // never run here
 		}
 		throw new IllegalStateException("AutoKey.getSeed failed: " + ret);
@@ -231,7 +233,8 @@ public class AutoKey {
 					return next; // allocate in range success
 			}
 
-			synchronized (this) {
+			lock();
+			try {
 				//noinspection NumberEquality
 				if (range != localRange)
 					continue;
@@ -269,9 +272,12 @@ public class AutoKey {
 					}
 				} catch (InterruptedException | ExecutionException e) {
 					Task.forceThrow(e);
+					//noinspection UnreachableCode
 					return -1; // never run here
 				}
 				throw new IllegalStateException("AutoKey.nextSeed failed: " + ret);
+			} finally {
+				unlock();
 			}
 		}
 	}

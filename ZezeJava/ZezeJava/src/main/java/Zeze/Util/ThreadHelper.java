@@ -1,5 +1,9 @@
 package Zeze.Util;
 
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -8,6 +12,16 @@ public class ThreadHelper extends Thread {
 
 	private volatile boolean running = true;
 	private boolean idle = true;
+	private final ReentrantLock thisLock = new ReentrantLock();
+	private final Condition thisCond = thisLock.newCondition();
+
+	public Condition getThisCond() {
+		return thisCond;
+	}
+
+	public Lock getThisLock() {
+		return thisLock;
+	}
 
 	public ThreadHelper(String name) {
 		super(name);
@@ -32,7 +46,7 @@ public class ThreadHelper extends Thread {
 				join();
 				break;
 			} catch (Throwable ex) {
-				logger.warn(this.getClass().getName() + "shutdown. ignore ex=" + ex);
+				logger.warn("{} shutdown. ignore ex:", getClass().getName(), ex);
 			}
 		}
 	}
@@ -43,9 +57,14 @@ public class ThreadHelper extends Thread {
 		joinAssuring();
 	}
 
-	public synchronized void wakeup() {
-		idle = false;
-		this.notify();
+	public void wakeup() {
+		thisLock.lock();
+		try {
+			idle = false;
+			thisCond.signal();
+		} finally {
+			thisLock.unlock();
+		}
 	}
 
 	/**
@@ -55,14 +74,18 @@ public class ThreadHelper extends Thread {
 	 *
 	 * @param ms ms
 	 */
-	public final synchronized void sleepIdle(long ms) {
+	public final void sleepIdle(long ms) {
+		thisLock.lock();
 		try {
-			if (idle)
-				this.wait(ms);
+			if (idle) {
+				if (!thisCond.await(ms, TimeUnit.MILLISECONDS))
+					logger.debug("await timeout");
+			}
 		} catch (InterruptedException ex) {
-			logger.warn(this.getClass().getName() + "sleepOut. ex=" + ex);
+			logger.warn("{} sleepOut. ex:", getClass().getName(), ex);
 		} finally {
 			idle = true;
+			thisLock.unlock();
 		}
 	}
 

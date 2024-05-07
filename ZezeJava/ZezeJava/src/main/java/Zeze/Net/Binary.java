@@ -33,6 +33,13 @@ public final class Binary implements Comparable<Binary> {
 		this.count = bytes.length;
 	}
 
+	public boolean startsWith(Binary prefix) {
+		int prefixSize = prefix.count;
+		return count >= prefixSize && Arrays.equals(
+				bytes, offset, offset + prefixSize,
+				prefix.bytes, prefix.offset, prefix.offset + prefixSize);
+	}
+
 	/**
 	 * 这里实际上直接wrap传入的bytes，所以必须保证之后不能再修改bytes的值了。
 	 */

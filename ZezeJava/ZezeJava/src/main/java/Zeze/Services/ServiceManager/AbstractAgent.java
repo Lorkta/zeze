@@ -3,19 +3,32 @@ package Zeze.Services.ServiceManager;
 import java.io.Closeable;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Component.Threading;
 import Zeze.Config;
-import Zeze.Net.Binary;
+import Zeze.IModule;
+import Zeze.Net.ProtocolHandle;
+import Zeze.Net.Rpc;
 import Zeze.Util.Action1;
-import Zeze.Util.Action2;
 import Zeze.Util.Task;
+import Zeze.Util.TaskCompletionSource;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import java.util.List;
 
-public abstract class AbstractAgent implements Closeable {
-	static final Logger logger = LogManager.getLogger(AbstractAgent.class);
+/*
+ * Agent发起协议	ServiceManager处理后通知		Agent接收通知后回调
+ * EditService	给订阅者广播Edit				onChanged
+ * Subscribe	给发起者回复BSubscribeResult	onChanged
+ * UnSubscribe	无							无
+ */
+public abstract class AbstractAgent extends ReentrantLock implements Closeable {
+	static final @NotNull Logger logger = LogManager.getLogger(AbstractAgent.class);
 
 	// key is ServiceName。对于一个Agent，一个服务只能有一个订阅。
 	// ServiceName ->
@@ -26,18 +39,17 @@ public abstract class AbstractAgent implements Closeable {
 	/**
 	 * 订阅服务状态发生变化时回调。 如果需要处理这个事件，请在订阅前设置回调。
 	 */
-	protected Action1<Agent.SubscribeState> onChanged; // Simple (如果没有定义OnUpdate和OnRemove) Or ReadyCommit (Notify, Commit)
-	protected Action2<Agent.SubscribeState, BServiceInfo> onUpdate; // Simple (Register, Update)
-	protected Action2<Agent.SubscribeState, BServiceInfo> onRemove; // Simple (UnRegister)
-	protected Action1<Agent.SubscribeState> onPrepare; // ReadyCommit 的第一步回调。
-	protected Action1<BServerLoad> onSetServerLoad;
+	protected @Nullable Action1<BEditService> onChanged;
+	protected @Nullable Action1<BServerLoad> onSetServerLoad;
 
 	// 返回是否处理成功且不需要其它notifier继续处理
 	protected final ConcurrentHashMap<String, Action1<BOfflineNotify>> onOfflineNotifies = new ConcurrentHashMap<>();
 
 	// 应用可以在这个Action内起一个测试事务并执行一次。也可以实现其他检测。
 	// ServiceManager 定时发送KeepAlive给Agent，并等待结果。超时则认为服务失效。
-	protected Runnable onKeepAlive;
+	protected @Nullable Runnable onKeepAlive;
+	private volatile TaskCompletionSource<TidCache> lastTidCacheFuture;
+
 
 	protected final ConcurrentHashMap<String, AutoKey> autoKeys = new ConcurrentHashMap<>();
 
@@ -47,23 +59,23 @@ public abstract class AbstractAgent implements Closeable {
 		return subscribeStates;
 	}
 
-	public Config getConfig() {
+	public @NotNull Config getConfig() {
 		return config;
 	}
 
-	public Action1<Agent.SubscribeState> getOnChanged() {
+	public @Nullable Action1<BEditService> getOnChanged() {
 		return onChanged;
 	}
 
-	public void setOnChanged(Action1<Agent.SubscribeState> value) {
+	public void setOnChanged(@Nullable Action1<BEditService> value) {
 		onChanged = value;
 	}
 
-	public void setOnSetServerLoad(Action1<BServerLoad> value) {
+	public void setOnSetServerLoad(@Nullable Action1<BServerLoad> value) {
 		onSetServerLoad = value;
 	}
 
-	protected boolean triggerOfflineNotify(BOfflineNotify notify) {
+	protected boolean triggerOfflineNotify(@NotNull BOfflineNotify notify) {
 		var handle = onOfflineNotifies.get(notify.notifyId);
 		if (null == handle)
 			return false;
@@ -77,321 +89,257 @@ public abstract class AbstractAgent implements Closeable {
 		}
 	}
 
-	public void setOnPrepare(Action1<Agent.SubscribeState> value) {
-		onPrepare = value;
-	}
-
-	public Action2<Agent.SubscribeState, BServiceInfo> getOnRemoved() {
-		return onRemove;
-	}
-
-	public void setOnRemoved(Action2<Agent.SubscribeState, BServiceInfo> value) {
-		onRemove = value;
-	}
-
-	public Action2<Agent.SubscribeState, BServiceInfo> getOnUpdate() {
-		return onUpdate;
-	}
-
-	public void setOnUpdate(Action2<Agent.SubscribeState, BServiceInfo> value) {
-		onUpdate = value;
-	}
-
-	public Runnable getOnKeepAlive() {
+	public @Nullable Runnable getOnKeepAlive() {
 		return onKeepAlive;
 	}
 
-	public void setOnKeepAlive(Runnable value) {
+	public void setOnKeepAlive(@Nullable Runnable value) {
 		onKeepAlive = value;
 	}
 
-	protected abstract boolean sendReadyList(String serviceName, long serialId);
+	protected abstract void allocate(@NotNull AutoKey autoKey, int pool);
 
-	protected abstract void allocate(AutoKey autoKey, int pool);
+	public TaskCompletionSource<TidCache> getLastTidCacheFuture() {
+		return lastTidCacheFuture;
+	}
+
+	public @NotNull TaskCompletionSource<TidCache> allocateTidCacheFuture(String globalName) {
+		var future = new TaskCompletionSource<TidCache>();
+		var tmp = lastTidCacheFuture;
+		var allocateCount = tmp == null ? TidCache.ALLOCATE_COUNT_MIN : tmp.get().allocateCount();
+		var sent = allocateAsync(globalName, allocateCount, (rpc) -> {
+			lock();
+			try {
+				if (rpc.getResultCode() == 0) {
+					var newest = new TidCache(globalName, this, rpc.Result.getStartId(), rpc.Result.getCount());
+					future.setResult(newest);
+				} else {
+					future.setException(new Exception("AllocateId rc=" + IModule.getErrorCode(rpc.getResultCode())));
+				}
+			} finally {
+				unlock();
+			}
+			return 0;
+		});
+		if (!sent)
+			future.setException(new Exception("AllocatedId send fail."));
+
+		lock();
+		try {
+			lastTidCacheFuture = future;
+		} finally {
+			unlock();
+		}
+		return future;
+	}
+
+	protected abstract boolean allocateAsync(String globalName, int allocCount,
+											 ProtocolHandle<Rpc<BAllocateIdArgument, BAllocateIdResult>> callback);
 
 	public abstract void start() throws Exception;
 
 	public abstract void waitReady();
 
+	private static final String SMCallbackOneByOneKey = "SMCallbackOneByOneKey";
+
+	protected void triggerOnChanged(@NotNull BEditService edit) {
+		if (onChanged != null) {
+			Task.getOneByOne().Execute(SMCallbackOneByOneKey, () -> {
+				try {
+					onChanged.run(edit);
+				} catch (Throwable e) { // logger.error
+					logger.error("", e);
+				}
+			});
+		}
+	}
+
 	// 【警告】
 	// 记住当前已经注册和订阅信息，当ServiceManager连接发生重连时，重新发送请求。
 	// 维护这些状态数据都是先更新本地再发送远程请求，在失败的时候rollback。
 	// 当同一个Key(比如ServiceName)存在并发时，现在处理所有情况，但不保证都是合理的。
-	public final class SubscribeState {
-		public final BSubscribeInfo subscribeInfo;
-		public volatile BServiceInfos serviceInfos;
-		public volatile BServiceInfos serviceInfosPending;
+	public static final class SubscribeState extends ReentrantLock {
+		private final @NotNull BSubscribeInfo subscribeInfo;
+		private volatile @NotNull BServiceInfosVersion serviceInfos = new BServiceInfosVersion();
 
-		/**
-		 * 刚初始化时为false，任何修改ServiceInfos都会设置成true。 用来处理Subscribe返回的第一份数据和Commit可能乱序的问题。
-		 * 目前的实现不会发生乱序。
-		 */
-		public boolean committed = false;
 		// 服务准备好。
-		public final ConcurrentHashMap<String, Object> localStates = new ConcurrentHashMap<>();
+		private final ConcurrentHashMap<String, Object> localStates = new ConcurrentHashMap<>();
 		private @Nullable Iterator<Map.Entry<String, Object>> localStatesIterator;
 
-		public synchronized @Nullable Map.Entry<String, Object> getNextStateEntry() {
-			if (localStatesIterator == null || !localStatesIterator.hasNext())
-				localStatesIterator = localStates.entrySet().iterator();
-			return localStatesIterator.hasNext() ? localStatesIterator.next() : null;
+		public SubscribeState(@NotNull BSubscribeInfo info) {
+			subscribeInfo = info;
+		}
+
+		public @Nullable Map.Entry<String, Object> getNextStateEntry() {
+			lock();
+			try {
+				if (localStatesIterator == null || !localStatesIterator.hasNext())
+					localStatesIterator = localStates.entrySet().iterator();
+				return localStatesIterator.hasNext() ? localStatesIterator.next() : null;
+			} finally {
+				unlock();
+			}
 		}
 
 		@Override
-		public String toString() {
-			return getSubscribeType() + " " + serviceInfos;
+		public @NotNull String toString() {
+			return serviceInfos.toString();
 		}
 
 		public BSubscribeInfo getSubscribeInfo() {
 			return subscribeInfo;
 		}
 
-		public int getSubscribeType() {
-			return subscribeInfo.getSubscribeType();
-		}
-
-		public String getServiceName() {
+		public @NotNull String getServiceName() {
 			return subscribeInfo.getServiceName();
 		}
 
-		public BServiceInfos getServiceInfos() {
+		/**
+		 * @return 只读, 禁止修改
+		 */
+		public @NotNull BServiceInfosVersion getServiceInfosVersion() {
 			return serviceInfos;
 		}
 
-		public BServiceInfos getServiceInfosPending() {
-			return serviceInfosPending;
+		/**
+		 * @return 只读, 禁止修改
+		 */
+		public @Nullable BServiceInfos getServiceInfos(long version) {
+			return serviceInfos.getInfos(version);
 		}
 
-		public SubscribeState(BSubscribeInfo info) {
-			subscribeInfo = info;
-			serviceInfos = new BServiceInfos(info.getServiceName());
+		/**
+		 * @return 只读, 禁止修改
+		 */
+		public @Nullable BServiceInfos findNewestInfos() {
+			return serviceInfos.getNewestInfos();
+		}
+
+		public @Nullable BServiceInfo findServiceInfoByIdentity(@NotNull String identity) {
+			for (var it = serviceInfos.getInfosIterator(); it.moveToNext(); ) {
+				var info = it.value().findServiceInfoByIdentity(identity);
+				if (info != null)
+					return info;
+			}
+			return null;
+		}
+
+		public @Nullable BServiceInfo findServiceInfoByServerId(int serverId) {
+			return findServiceInfoByIdentity(String.valueOf(serverId));
 		}
 
 		// NOT UNDER LOCK
-		private boolean trySendReadyServiceList() {
-			var pending = serviceInfosPending;
-			if (pending == null)
-				return false;
 
-			for (var p : pending.getServiceInfoListSortedByIdentity()) {
-				if (!localStates.containsKey(p.getServiceIdentity()))
-					return false;
-			}
-			sendReadyList(pending.getServiceName(), pending.getSerialId());
-			return true;
+		public @NotNull ConcurrentHashMap<String, Object> getLocalStates() {
+			return localStates;
 		}
 
-		public void setServiceIdentityReadyState(String identity, Object state) {
+		public void setIdentityLocalState(@NotNull String identity, @Nullable Object state) {
 			if (state == null)
 				localStates.remove(identity);
 			else
 				localStates.put(identity, state);
-
-			synchronized (this) {
-				// 尝试发送Ready，如果有pending.
-				trySendReadyServiceList();
-			}
 		}
 
-		private void prepareAndTriggerOnChanged() {
-			if (onChanged != null) {
-				Task.getCriticalThreadPool().execute(() -> {
-					try {
-						onChanged.run(this);
-					} catch (Throwable e) { // logger.error
-						logger.error("", e);
-					}
-				});
-			}
-		}
-
-		public synchronized void onRegister(BServiceInfo info) {
-			serviceInfos.insert(info);
-			if (onUpdate != null) {
-				Task.getCriticalThreadPool().execute(() -> {
-					try {
-						onUpdate.run(this, info);
-					} catch (Throwable e) { // logger.error
-						logger.error("", e);
-					}
-				});
-			} else if (onChanged != null) {
-				Task.getCriticalThreadPool().execute(() -> {
-					try {
-						onChanged.run(this);
-					} catch (Throwable e) { // logger.error
-						logger.error("", e);
-					}
-				});
-			}
-		}
-
-		public synchronized void onUnRegister(BServiceInfo info) {
-			var removed = serviceInfos.remove(info);
-			if (removed == null)
-				return;
-			if (onRemove != null) {
-				Task.getCriticalThreadPool().execute(() -> {
-					try {
-						onRemove.run(this, removed);
-					} catch (Throwable e) { // logger.error
-						logger.error("", e);
-					}
-				});
-			} else if (onChanged != null) {
-				Task.getCriticalThreadPool().execute(() -> {
-					try {
-						onChanged.run(this);
-					} catch (Throwable e) { // logger.error
-						logger.error("", e);
-					}
-				});
-			}
-		}
-
-		public synchronized void onUpdate(BServiceInfo info) {
-			var exist = serviceInfos.findServiceInfo(info);
-			if (exist == null)
-				return;
-			exist.setPassiveIp(info.getPassiveIp());
-			exist.setPassivePort(info.getPassivePort());
-			exist.setExtraInfo(info.getExtraInfo());
-
-			if (onUpdate != null) {
-				Task.getCriticalThreadPool().execute(() -> {
-					try {
-						onUpdate.run(this, exist);
-					} catch (Throwable e) { // logger.error
-						logger.error("", e);
-					}
-				});
-			} else if (onChanged != null) {
-				Task.getCriticalThreadPool().execute(() -> {
-					try {
-						onChanged.run(this);
-					} catch (Throwable e) { // logger.error
-						logger.error("", e);
-					}
-				});
-			}
-		}
-
-		public synchronized void onNotify(BServiceInfos infos) {
-			switch (getSubscribeType()) {
-			case BSubscribeInfo.SubscribeTypeSimple:
-				serviceInfos = infos;
-				committed = true;
-				prepareAndTriggerOnChanged();
-				break;
-
-			case BSubscribeInfo.SubscribeTypeReadyCommit:
-				if (serviceInfosPending == null || infos.getSerialId() > serviceInfosPending.getSerialId()) {
-					serviceInfosPending = infos;
-					if (onPrepare != null) {
-						Task.getCriticalThreadPool().execute(() -> {
-							try {
-								onPrepare.run(this);
-							} catch (Throwable e) { // logger.error
-								logger.error("", e);
-							}
-						});
-					}
-					trySendReadyServiceList();
+		/**
+		 * @return 被替换的旧BServiceInfo; 无更新或无变化则返回null
+		 */
+		public @Nullable BServiceInfo onRegister(@NotNull BServiceInfo info) {
+			lock();
+			try {
+				var versions = serviceInfos.getInfos(info.getVersion());
+				if (null != versions) {
+					var exist = versions.insert(info);
+					return null != exist && !exist.fullEquals(info) ? exist : null;
 				}
-				break;
+				return null;
+			} finally {
+				unlock();
 			}
 		}
 
-		public synchronized void onFirstCommit(BServiceInfos infos) {
-			if (committed)
-				return;
-			if (getSubscribeType() == BSubscribeInfo.SubscribeTypeReadyCommit)
-				return; // ReadyCommit 模式不会走到这里。OnNotify(infos);
-			committed = true;
-			serviceInfos = infos;
-			serviceInfosPending = null;
-			prepareAndTriggerOnChanged();
+		public boolean onUnRegister(@NotNull BServiceInfo info) {
+			lock();
+			try {
+				var versions = serviceInfos.getInfos(info.getVersion());
+				if (null != versions)
+					return (null != versions.remove(info));
+				return false;
+			} finally {
+				unlock();
+			}
 		}
 
-		public synchronized void onCommit(BServiceListVersion version) {
-			if (serviceInfosPending == null)
-				return; // 并发过来的Commit，只需要处理一个。
-			if (version.serialId != serviceInfosPending.getSerialId())
-				logger.warn("onCommit {} {} != {}", getServiceName(), version.serialId, serviceInfosPending.getSerialId());
-			serviceInfos = serviceInfosPending;
-			serviceInfosPending = null;
-			committed = true;
-			prepareAndTriggerOnChanged();
+		public void onFirstCommit(@NotNull BServiceInfosVersion infos, @NotNull BEditService edits) {
+			for (var it = infos.getInfosIterator(); it.moveToNext(); )
+				edits.getAdd().addAll(it.value().getSortedIdentities());
+			lock();
+			try {
+				serviceInfos = infos;
+			} finally {
+				unlock();
+			}
 		}
 	}
 
-	public BServiceInfo registerService(String name, String identity) {
-		return registerService(name, identity, null, 0, null);
-	}
-
-	public BServiceInfo registerService(String name, String identity, String ip) {
-		return registerService(name, identity, ip, 0, null);
-	}
-
-	public BServiceInfo registerService(String name, String identity, String ip, int port) {
-		return registerService(name, identity, ip, port, null);
-	}
-
-	public BServiceInfo registerService(String name, String identity, String ip, int port, Binary extraInfo) {
-		return registerService(new BServiceInfo(name, identity, ip, port, extraInfo));
-	}
-
-	public BServiceInfo updateService(String name, String identity, String ip, int port, Binary extraInfo) {
-		return updateService(new BServiceInfo(name, identity, ip, port, extraInfo));
-	}
-
-	public abstract BServiceInfo registerService(BServiceInfo info);
-
-	public abstract BServiceInfo updateService(BServiceInfo info);
-
-	protected static void verify(String identity) {
+	protected static void verify(@NotNull String identity) {
 		if (!identity.startsWith("@") && !identity.startsWith("#")) {
 			//noinspection ResultOfMethodCallIgnored
 			Integer.parseInt(identity);
 		}
 	}
 
-	public void unRegisterService(String name, String identity) {
-		unRegisterService(new BServiceInfo(name, identity));
+	public void registerService(@NotNull BServiceInfo info) {
+		var edit = new BEditService();
+		edit.getAdd().add(info);
+		editService(edit);
 	}
 
-	public abstract void unRegisterService(BServiceInfo info);
-
-	public SubscribeState subscribeService(String serviceName, int type) {
-		return subscribeService(serviceName, type, null);
+	public void unRegisterService(@NotNull BServiceInfo info) {
+		var edit = new BEditService();
+		edit.getRemove().add(info);
+		editService(edit);
 	}
 
-	public SubscribeState subscribeService(String serviceName, int type, Object state) {
-		if (type != BSubscribeInfo.SubscribeTypeSimple && type != BSubscribeInfo.SubscribeTypeReadyCommit)
-			throw new UnsupportedOperationException("Unknown SubscribeType: " + type);
+	public abstract void editService(@NotNull BEditService arg);
 
-		var info = new BSubscribeInfo();
-		info.setServiceName(serviceName);
-		info.setSubscribeType(type);
-		info.setLocalState(state);
-		return subscribeService(info);
+	public @NotNull SubscribeState subscribeService(@NotNull BSubscribeInfo info) {
+		var infos = new BSubscribeArgument();
+		infos.subs.add(info);
+		return subscribeServices(infos).get(0);
 	}
 
-	public abstract SubscribeState subscribeService(BSubscribeInfo info);
+	public @NotNull List<SubscribeState> subscribeServices(@NotNull BSubscribeArgument infos) {
+		try {
+			return subscribeServicesAsync(infos).get();
+		} catch (InterruptedException | ExecutionException e) {
+			Task.forceThrow(e);
+			throw new AssertionError(); // never run here
+		}
+	}
 
-	public abstract void unSubscribeService(String serviceName);
+	public abstract @NotNull CompletableFuture<List<SubscribeState>> subscribeServicesAsync(
+			@NotNull BSubscribeArgument info);
 
-	public AutoKey getAutoKey(String name) {
+	public void unSubscribeService(@NotNull String serviceName) {
+		var arg = new BUnSubscribeArgument();
+		arg.serviceNames.add(serviceName);
+		unSubscribeService(arg);
+	}
+
+	public abstract void unSubscribeService(@NotNull BUnSubscribeArgument arg);
+
+	public @NotNull AutoKey getAutoKey(@NotNull String name) {
 		return autoKeys.computeIfAbsent(name, k -> new AutoKey(k, this));
 	}
 
-	public abstract boolean setServerLoad(BServerLoad load);
+	public abstract boolean setServerLoad(@NotNull BServerLoad load);
 
-	public abstract void offlineRegister(BOfflineNotify argument, Action1<BOfflineNotify> handle);
+	public abstract void offlineRegister(@NotNull BOfflineNotify argument, @NotNull Action1<BOfflineNotify> handle);
 
-	protected static void setCurrentAndCount(AutoKey autoKey, long current, int count) {
+	protected static void setCurrentAndCount(@NotNull AutoKey autoKey, long current, int count) {
 		autoKey.setCurrentAndCount(current, count);
 	}
 
-	public abstract Threading getThreading();
+	public abstract @NotNull Threading getThreading();
 }

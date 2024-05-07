@@ -1,8 +1,9 @@
 package Zeze.Services.ServiceManager;
 
 import java.util.concurrent.atomic.AtomicLong;
+import Zeze.Util.FastLock;
 
-public final class AutoKey {
+public final class AutoKey extends FastLock {
 	private final String name;
 	private final AbstractAgent agent;
 	private final AtomicLong current = new AtomicLong();
@@ -55,11 +56,14 @@ public final class AutoKey {
 				continue;
 			}
 
-			synchronized (this) {
+			lock();
+			try {
 				if (idEnd == end) {
 					adjustAllocateCount();
 					agent.allocate(this, allocateCount);
 				}
+			} finally {
+				unlock();
 			}
 		}
 	}

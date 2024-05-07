@@ -13,6 +13,7 @@ import java.util.Date;
 import java.util.TimeZone;
 import java.util.concurrent.Executors;
 import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Config;
 import Zeze.Net.Acceptor;
 import Zeze.Net.AsyncSocket;
@@ -46,7 +47,7 @@ import org.jetbrains.annotations.Nullable;
 瓶颈及风险: 如果发送的日志速率超过写日志线程的写入速率,会达到传输队列指定的条数或大小上限,导致服务器端接收日志的IO线程暂停工作,
       进而导致客户端无法发送或产生堆积,此时发送方应主动丢弃. 记录的日志时间戳由服务器端在写入时确定. 过时的日志文件需要其它清理手段.
 */
-public final class BinLogger {
+public final class BinLogger extends ReentrantLock {
 	private static final Logger logger = LogManager.getLogger(BinLogger.class);
 	private static final int perfIndexSendLogFail = PerfCounter.instance.registerCountIndex("BinLogger.SendLogFail");
 	private static final int perfIndexWriteLog = PerfCounter.instance.registerCountIndex("BinLogger.WriteLog");
@@ -162,34 +163,49 @@ public final class BinLogger {
 		}
 
 		@Override
-		public synchronized void start() throws Exception {
-			if (connector != null)
-				stop();
-			var cfg = getConfig();
-			int n = cfg.connectorCount();
-			if (n != 1)
-				throw new IllegalStateException("connectorCount = " + n + " != 1");
-			cfg.forEachConnector(c -> this.connector = c);
-			super.start();
+		public void start() throws Exception {
+			lock();
+			try {
+				if (connector != null)
+					stop();
+				var cfg = getConfig();
+				int n = cfg.connectorCount();
+				if (n != 1)
+					throw new IllegalStateException("connectorCount = " + n + " != 1");
+				cfg.forEachConnector(c -> this.connector = c);
+				super.start();
+			} finally {
+				unlock();
+			}
 		}
 
-		public synchronized @NotNull BinLoggerAgent start(@NotNull String host, int port) throws Exception {
-			if (connector != null)
-				stop();
-			connector = new Connector(host, port, true);
-			connector.SetService(this);
-			connector.setAutoReconnect(true);
-			connector.start();
-			return this;
+		public @NotNull BinLoggerAgent start(@NotNull String host, int port) throws Exception {
+			lock();
+			try {
+				if (connector != null)
+					stop();
+				connector = new Connector(host, port, true);
+				connector.SetService(this);
+				connector.setAutoReconnect(true);
+				connector.start();
+				return this;
+			} finally {
+				unlock();
+			}
 		}
 
 		@Override
-		public synchronized void stop() throws Exception {
-			if (connector != null) {
-				connector.stop();
-				connector = null;
+		public void stop() throws Exception {
+			lock();
+			try {
+				if (connector != null) {
+					connector.stop();
+					connector = null;
+				}
+				super.stop();
+			} finally {
+				unlock();
 			}
-			super.stop();
 		}
 
 		public void waitReady() {
@@ -200,7 +216,8 @@ public final class BinLogger {
 			var so = connector.getSocket();
 			if (so != null && so.Send(new LogData(roleId, log)))
 				return true;
-			PerfCounter.instance.addCountInfo(perfIndexSendLogFail);
+			if (PerfCounter.ENABLE_PERF)
+				PerfCounter.instance.addCountInfo(perfIndexSendLogFail);
 			return false;
 		}
 	}
@@ -258,37 +275,47 @@ public final class BinLogger {
 		}
 
 		// 参数host,port优先; 如果传null/<=0则以config为准; 如果config也没配置则用默认值null/DEFAULT_PORT
-		public synchronized void start(@Nullable String host, int port) throws Exception {
-			if (started)
-				stop();
-			started = true;
-			logger.info("BinLoggerService starting ...");
-			var sc = getConfig();
-			if (sc.acceptorCount() == 0)
-				sc.addAcceptor(new Acceptor(port > 0 ? port : DEFAULT_PORT, host));
-			else {
-				sc.forEachAcceptor2(acceptor -> {
-					if (host != null)
-						acceptor.setIp(host);
-					if (port > 0)
-						acceptor.setPort(port);
-					return false;
-				});
+		public void start(@Nullable String host, int port) throws Exception {
+			lock();
+			try {
+				if (started)
+					stop();
+				started = true;
+				logger.info("BinLoggerService starting ...");
+				var sc = getConfig();
+				if (sc.acceptorCount() == 0)
+					sc.addAcceptor(new Acceptor(port > 0 ? port : DEFAULT_PORT, host));
+				else {
+					sc.forEachAcceptor2(acceptor -> {
+						if (host != null)
+							acceptor.setIp(host);
+						if (port > 0)
+							acceptor.setPort(port);
+						return false;
+					});
+				}
+				startLogger();
+				super.start();
+			} finally {
+				unlock();
 			}
-			startLogger();
-			super.start();
 		}
 
 		@Override
-		public synchronized void stop() throws Exception {
-			if (!started)
-				return;
-			started = false;
-			logger.info("BinLoggerService stopping ...");
+		public void stop() throws Exception {
+			lock();
 			try {
-				super.stop();
+				if (!started)
+					return;
+				started = false;
+				logger.info("BinLoggerService stopping ...");
+				try {
+					super.stop();
+				} finally {
+					stopLogger();
+				}
 			} finally {
-				stopLogger();
+				unlock();
 			}
 		}
 
@@ -445,14 +472,14 @@ public final class BinLogger {
 							return 0;
 						}
 						if (timeBegin == 0)
-							timeBegin = System.nanoTime();
+							timeBegin = PerfCounter.ENABLE_PERF ? System.nanoTime() : 0;
 						waitingQueue = true;
 						queueLockCond.await();
 					}
 				} finally {
 					queueLock.unlock();
 				}
-				if (timeBegin != 0)
+				if (PerfCounter.ENABLE_PERF && timeBegin != 0)
 					PerfCounter.instance.addRunInfo("BinLogger.waitQueue", System.nanoTime() - timeBegin);
 				logger.info("drop LogData: roleId={}, type={}, size={}, sender={}",
 						p.roleId, p.dataType, dataSize, p.getSender());
@@ -522,7 +549,8 @@ public final class BinLogger {
 							idFile.write(buf);
 						}
 						readLogQueue.clear();
-						PerfCounter.instance.addCountInfo(perfIndexWriteLog, queueSize);
+						if (PerfCounter.ENABLE_PERF)
+							PerfCounter.instance.addCountInfo(perfIndexWriteLog, queueSize);
 					} else {
 						if (curMs - lastFlushMs >= FLUSH_PERIOD) { // 定时刷新到OS
 							lastFlushMs = curMs;

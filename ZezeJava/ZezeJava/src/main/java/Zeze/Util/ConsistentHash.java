@@ -1,85 +1,66 @@
 package Zeze.Util;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
-import java.util.Set;
 import Zeze.Serialize.ByteBuffer;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import Zeze.Transaction.Bean;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-public class ConsistentHash<E> extends FastLock {
-	private static final Logger logger = LogManager.getLogger(ConsistentHash.class);
+/**
+ * 稳定公平的一致性hash
+ * 支持并发
+ *
+ * @param <E> 要求实现equals和compareTo
+ */
+public class ConsistentHash<E extends Comparable<E>> extends FastRWLock {
+	private final @NotNull SortedMap<Integer, E> circle;
+	private final HashMap<E, String> nodes = new HashMap<>(); // <node,nodeKey>
 
-	private final SortedMap<Integer, E> circle = new SortedMap<>();
-	private final HashMap<E, Integer[]> nodes = new HashMap<>();
-	private final @NotNull Set<E> nodesView = Collections.unmodifiableSet(nodes.keySet());
-
-	public @NotNull Set<E> getNodes() {
-		return nodesView;
+	public ConsistentHash(@Nullable SortedMap.HashFunc<Integer, E> hashFunc) {
+		circle = new SortedMap<>(hashFunc);
 	}
 
-	public void add(@Nullable String nodeKey, @NotNull E node) {
-		//noinspection ConstantValue
-		if (node == null)
-			throw new NullPointerException("node");
-		var virtual = new Integer[160];
+	public boolean isEmpty() {
+		readLock();
 		try {
-			nodeKey = nodeKey != null ? nodeKey + '-' : "-";
-			var md5 = MessageDigest.getInstance("MD5");
-			for (int i = 0, half = virtual.length / 4; i < half; ++i) {
-				var hash4 = md5.digest((nodeKey + i).getBytes(StandardCharsets.UTF_8));
-				for (int j = 0; j < 4; ++j)
-					virtual[i * 4 + j] = ByteBuffer.ToInt(hash4, j * 4);
-			}
-		} catch (NoSuchAlgorithmException e) {
-			Task.forceThrow(e);
-		}
-
-		List<SortedMap.Entry<Integer, E>> conflicts;
-		lock();
-		try {
-			if (nodes.putIfAbsent(node, virtual) != null)
-				return; // 忽略重复加入的node。不报告这个错误，简化外面的使用。
-			conflicts = circle.addAll(virtual, node);
+			return nodes.isEmpty();
 		} finally {
-			unlock();
+			readUnlock();
 		}
-		for (var conflict : conflicts)
-			logger.warn("hash conflict! key={} node={}", conflict.key, conflict.value);
 	}
 
-	public void remove(@NotNull E node) {
-		//noinspection ConstantValue
-		if (node == null)
-			throw new NullPointerException("node");
-		lock();
+	public int size() {
+		readLock();
 		try {
-			var virtual = nodes.remove(node);
-			if (null == virtual)
-				return;
-			// 批量remove？
-			// virtual是排序的，反向遍历，然后删除效率更高。
-			for (var i = virtual.length - 1; i >= 0; --i) {
-				var hash = virtual[i];
-				circle.remove(hash, node);
-			}
+			return nodes.size();
 		} finally {
-			unlock();
+			readUnlock();
 		}
 	}
 
-	public @Nullable E get(int hash) {
-		hash = ByteBuffer.calc_hashnr(((long)hash << 32) ^ hash);
-		lock();
+	public int circleSize() {
+		readLock();
 		try {
-			// 换成新的SortedMap的方法。原来是ceilingEntry，对不对。
-			var e = circle.upperBound(hash);
+			return circle.size();
+		} finally {
+			readUnlock();
+		}
+	}
+
+	public int circleKeySize() {
+		readLock();
+		try {
+			return circle.keySize();
+		} finally {
+			readUnlock();
+		}
+	}
+
+	public @Nullable E get(long hash) {
+		int hash32 = ByteBuffer.calc_hashnr(hash);
+		readLock();
+		try {
+			var e = circle.lowerBound(hash32);
 			if (e == null) {
 				e = circle.first();
 				if (e == null)
@@ -87,7 +68,76 @@ public class ConsistentHash<E> extends FastLock {
 			}
 			return e.getValue();
 		} finally {
-			unlock();
+			readUnlock();
+		}
+	}
+
+	public @NotNull E @NotNull [] toArray(E @NotNull [] array) {
+		readLock();
+		try {
+			return nodes.keySet().toArray(array);
+		} finally {
+			readUnlock();
+		}
+	}
+
+	@Override
+	public @NotNull String toString() {
+		readLock();
+		try {
+			return circle.toString();
+		} finally {
+			readUnlock();
+		}
+	}
+
+	// 以上是只读方法; 以下是修改方法
+
+	public void clear() {
+		writeLock();
+		try {
+			circle.clear();
+			nodes.clear();
+		} finally {
+			writeUnlock();
+		}
+	}
+
+	private static @NotNull Integer @NotNull [] genVirtualIds(@NotNull String nodeKey) {
+		var virtual = new Integer[160];
+		var r = new StableRandom(Bean.hash64(nodeKey));
+		for (int i = 0, n = virtual.length; i < n; i++)
+			virtual[i] = r.next();
+		return virtual;
+	}
+
+	public void add(@NotNull String nodeKey, @NotNull E node) {
+		//noinspection ConstantValue
+		if (node == null)
+			throw new NullPointerException("node");
+		var virtualIds = genVirtualIds(nodeKey);
+
+		writeLock();
+		try {
+			if (nodes.putIfAbsent(node, nodeKey) == null) // 忽略重复加入的node。不报告这个错误，简化外面的使用。
+				circle.addAll(virtualIds, node);
+		} finally {
+			writeUnlock();
+		}
+	}
+
+	public void remove(@NotNull E node) {
+		//noinspection ConstantValue
+		if (node == null)
+			throw new NullPointerException("node");
+
+		writeLock();
+		try {
+			var nodeKey = nodes.remove(node);
+			if (nodeKey != null)
+				circle.removeAll(genVirtualIds(nodeKey), node);
+		} finally {
+			writeUnlock();
 		}
 	}
 }

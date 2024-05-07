@@ -5,17 +5,27 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using Zeze.Builtin.Provider;
+using Zeze.Net;
 using Zeze.Services.ServiceManager;
 
 namespace Zeze.Arch
 {
     public class ProviderDistribute
     {
-        public Application Zeze { get; set; }
-        public LoadConfig LoadConfig { get; set; }
-        public Zeze.Net.Service ProviderService { get; set; }
+        public Application Zeze { get; private set; }
+        public LoadConfig LoadConfig { get; private set; }
+        public Zeze.Net.Service ProviderService { get; private set; }
+        public long Version { get; private set; }
 
         public int MaxOnlineNew { get; set; } = 30;
+
+        public ProviderDistribute(long version, Application zeze, Service providerService, LoadConfig loadConfig)
+        {
+            Zeze = zeze;
+            ProviderService = providerService;
+            LoadConfig = loadConfig;
+            Version = version;
+        }
 
         public static string MakeServiceName(string prefix, int moduleId)
         {
@@ -24,33 +34,16 @@ namespace Zeze.Arch
 
         public ConcurrentDictionary<string, Zeze.Util.ConsistentHash<ServiceInfo>> ConsistentHashs = new();
 
-        public void AddServer(Agent.SubscribeState state, ServiceInfo s)
+        public void AddServer(ServiceInfo s)
         {
             var consistentHash = ConsistentHashs.GetOrAdd(s.ServiceName, key => new());
             consistentHash.Add(s.ServiceIdentity, s);
         }
 
-        public void RemoveServer(Agent.SubscribeState state, ServiceInfo s)
+        public void RemoveServer(ServiceInfo s)
         {
             if (ConsistentHashs.TryGetValue(s.ServiceName, out var consistentHash))
                 consistentHash.Remove(s);
-        }
-
-        public void ApplyServers(Agent.SubscribeState ass)
-        {
-            var consistentHash = ConsistentHashs.GetOrAdd(ass.ServiceName, key => new());
-            var nodes = consistentHash.Nodes;
-            var current = new HashSet<ServiceInfo>();
-            foreach (var node in ass.ServiceInfos.SortedIdentity)
-            {
-                consistentHash.Add(node.ServiceIdentity, node);
-                current.Add(node);
-            }
-            foreach (var node in nodes)
-            {
-                if (!current.Contains(node))
-                    consistentHash.Remove(node);
-            }
         }
 
         public ServiceInfo ChoiceDataIndex(Agent.SubscribeState providers, int dataIndex, int dataConcurrentLevel)
@@ -65,9 +58,13 @@ namespace Zeze.Arch
             return null;
              */
             // TODO 下面的实现是临时的 see ChoiceHash
-            var list = providers.ServiceInfos.SortedIdentity;
+            if (false == providers.ServiceInfosVersion.InfosVersion.TryGetValue(Version, out var infos))
+                return null;
+
+            var list = infos.SortedIdentity;
             if (list.Count == 0)
                 return null;
+
             var servercount = (uint)Math.Min(dataConcurrentLevel, list.Count); // 服务器数量超过并发级别时，忽略更多的服务器。
 
             var serviceInfo = list[(int)((uint)dataIndex % servercount)];
@@ -107,7 +104,10 @@ namespace Zeze.Arch
             return null;
              TODO 下面的实现是临时的 see ChoiceDataIndex
              */
-            var list = providers.ServiceInfos.SortedIdentity;
+            if (false == providers.ServiceInfosVersion.InfosVersion.TryGetValue(Version, out var infos))
+                return null;
+
+            var list = infos.SortedIdentity;
             if (list.Count == 0)
                 return null;
 
@@ -137,7 +137,10 @@ namespace Zeze.Arch
         {
             provider = 0;
 
-            var list = providers.ServiceInfos.SortedIdentity;
+            if (false == providers.ServiceInfosVersion.InfosVersion.TryGetValue(Version, out var infos))
+                return false;
+
+            var list = infos.SortedIdentity;
             var frees = new List<ProviderSession>(list.Count);
             var all = new List<ProviderSession>(list.Count);
             int TotalWeight = 0;
@@ -201,7 +204,10 @@ namespace Zeze.Arch
             {
                 provider = 0;
 
-                var list = providers.ServiceInfos.SortedIdentity;
+                if (false == providers.ServiceInfosVersion.InfosVersion.TryGetValue(Version, out var infos))
+                    return false;
+
+                var list = infos.SortedIdentity;
                 // 最多遍历一次。循环里面 continue 时，需要递增索引。
                 for (int i = 0; i < list.Count; ++i, FeedFullOneByOneIndex.IncrementAndGet())
                 {
@@ -247,7 +253,10 @@ namespace Zeze.Arch
             if (false == Zeze.ServiceManager.SubscribeStates.TryGetValue(serviceName, out var providers))
                 return false;
 
-            var serviceInfo = providers.ServiceInfos.Find(serverId);
+            if (false == providers.ServiceInfosVersion.InfosVersion.TryGetValue(Version, out var infos))
+                return false;
+
+            var serviceInfo = infos.Find(serverId);
             if (null == serviceInfo)
                 return false;
 

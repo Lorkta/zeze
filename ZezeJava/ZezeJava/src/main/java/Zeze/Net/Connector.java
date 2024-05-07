@@ -1,10 +1,9 @@
 package Zeze.Net;
 
 import java.io.IOException;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Util.Task;
 import Zeze.Util.TaskCompletionSource;
 import org.jetbrains.annotations.NotNull;
@@ -19,7 +18,7 @@ import org.w3c.dom.Element;
  * 1. 在配置中通过 class="FullClassName" 的。
  * 2. 动态创建并加入Service
  */
-public class Connector {
+public class Connector extends ReentrantLock {
 	private static final int READY_TIMEOUT = 5000;
 
 	private final @NotNull String hostNameOrAddress;
@@ -57,6 +56,7 @@ public class Connector {
 		this.name = this.hostNameOrAddress + "_" + this.port;
 		this.isAutoReconnect = autoReconnect;
 	}
+
 	public Connector(@NotNull String host, int port) {
 		this(host, port, true);
 	}
@@ -116,11 +116,14 @@ public class Connector {
 		if (isAutoReconnect) {
 			TryReconnect();
 		} else {
-			synchronized (this) {
+			lock();
+			try {
 				if (reconnectTask != null) {
 					reconnectTask.cancel(false);
 					reconnectTask = null;
 				}
+			} finally {
+				unlock();
 			}
 		}
 	}
@@ -133,10 +136,15 @@ public class Connector {
 		return TryGetReadySocket() != null;
 	}
 
-	public final synchronized void SetService(@NotNull Service service) {
-		if (this.service != null)
-			throw new IllegalStateException("Connector of '" + getName() + "' Service != null");
-		this.service = service;
+	public final void SetService(@NotNull Service service) {
+		lock();
+		try {
+			if (this.service != null)
+				throw new IllegalStateException("Connector of '" + getName() + "' Service != null");
+			this.service = service;
+		} finally {
+			unlock();
+		}
 	}
 
 	// 允许子类重新定义Ready.
@@ -145,61 +153,80 @@ public class Connector {
 	}
 
 	public final @NotNull AsyncSocket GetReadySocket() {
-		try {
-			return futureSocket.get(READY_TIMEOUT, TimeUnit.MILLISECONDS);
-		} catch (InterruptedException | ExecutionException | TimeoutException e) {
-			throw new IllegalStateException(getName(), e);
-		}
+		return futureSocket.get(READY_TIMEOUT, TimeUnit.MILLISECONDS);
 	}
 
 	public final @Nullable AsyncSocket TryGetReadySocket() {
 		try {
 			return futureSocket.getNow();
-		} catch (ExecutionException e) {
+		} catch (Exception e) {
 			return null;
 		}
 	}
 
-	public synchronized void OnSocketClose(@NotNull AsyncSocket closed, @Nullable Throwable e) throws Exception {
-		if (socket == closed) {
-			stop(e);
-			TryReconnect();
+	public void OnSocketClose(@NotNull AsyncSocket closed, @Nullable Throwable e) throws Exception {
+		lock();
+		try {
+			if (socket == closed) {
+				stop(e);
+				TryReconnect();
+			}
+		} finally {
+			unlock();
 		}
 	}
 
-	public synchronized void OnSocketConnected(@SuppressWarnings("unused") @NotNull AsyncSocket so) {
-		isConnected = true;
-		reConnectDelay = 0;
+	public void OnSocketConnected(@SuppressWarnings("unused") @NotNull AsyncSocket so) {
+		lock();
+		try {
+			isConnected = true;
+			reConnectDelay = 0;
+		} finally {
+			unlock();
+		}
 	}
 
-	public synchronized void TryReconnect() {
-		if (!isAutoReconnect || socket != null || reconnectTask != null)
-			return;
+	public void TryReconnect() {
+		lock();
+		try {
+			if (!isAutoReconnect || socket != null || reconnectTask != null)
+				return;
 
-		reConnectDelay = reConnectDelay > 0 ? Math.min(reConnectDelay * 2, maxReconnectDelay) : 1000;
-		reconnectTask = Task.scheduleUnsafe(reConnectDelay, this::start);
+			reConnectDelay = reConnectDelay > 0 ? Math.min(reConnectDelay * 2, maxReconnectDelay) : 1000;
+			reconnectTask = Task.scheduleUnsafe(reConnectDelay, this::start);
+		} finally {
+			unlock();
+		}
 	}
 
 	// 需要逻辑相关的握手行为时，重载这个方法。
 	public void OnSocketHandshakeDone(@NotNull AsyncSocket so) {
-		synchronized (this) {
+		lock();
+		try {
 			if (socket == so) {
 				// java 没有TrySetResult，所以如果上面的检查不充分，仍然会有问题。
 				futureSocket.setResult(so);
 				return;
 			}
+		} finally {
+			unlock();
 		}
 		so.close(new Exception("not owner?"));
 	}
 
-	public synchronized void start() {
-		// always try cancel reconnect task
-		if (reconnectTask != null) {
-			reconnectTask.cancel(false);
-			reconnectTask = null;
+	public void start() {
+		lock();
+		try {
+			// always try cancel reconnect task
+			if (reconnectTask != null) {
+				reconnectTask.cancel(false);
+				reconnectTask = null;
+			}
+			if (socket == null)
+				socket = service.newClientSocket(hostNameOrAddress, port, userState, this);
+		} finally {
+			unlock();
 		}
-		if (socket == null)
-			socket = service.newClientSocket(hostNameOrAddress, port, userState, this);
 	}
 
 	public void stop() {
@@ -208,7 +235,8 @@ public class Connector {
 
 	public void stop(@Nullable Throwable e) {
 		AsyncSocket as;
-		synchronized (this) {
+		lock();
+		try {
 			// always try cancel reconnect task
 			if (reconnectTask != null) {
 				reconnectTask.cancel(false);
@@ -223,6 +251,8 @@ public class Connector {
 			isConnected = false;
 			as = socket;
 			socket = null; // 阻止递归。
+		} finally {
+			unlock();
 		}
 		as.close(e);
 	}

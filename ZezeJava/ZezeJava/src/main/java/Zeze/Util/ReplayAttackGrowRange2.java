@@ -2,7 +2,7 @@ package Zeze.Util;
 
 import java.util.Arrays;
 
-public class ReplayAttackGrowRange2 implements ReplayAttack {
+public class ReplayAttackGrowRange2 extends FastLock implements ReplayAttack {
 	private static final int BITS_SHIFT = 6; // 1 << 6 = 64 (bit count for long)
 	private static final int BITS_MASK = (1 << BITS_SHIFT) - 1; // 63
 

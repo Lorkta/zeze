@@ -2,6 +2,7 @@ package Zeze.Net;
 
 import java.net.InetAddress;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -19,7 +20,7 @@ import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
-public final class ServiceConf {
+public final class ServiceConf extends ReentrantLock {
 	private Service service;
 	private final @NotNull String name;
 	private @NotNull SocketOptions socketOptions = new SocketOptions();
@@ -60,13 +61,18 @@ public final class ServiceConf {
 			handshakeOptions = value;
 	}
 
-	public synchronized void setService(Service service) {
-		if (this.service != null) {
-			throw new IllegalStateException(String.format("ServiceConf of '%s' Service != null", getName()));
+	public void setService(Service service) {
+		lock();
+		try {
+			if (this.service != null) {
+				throw new IllegalStateException(String.format("ServiceConf of '%s' Service != null", getName()));
+			}
+			this.service = service;
+			forEachAcceptor(a -> a.SetService(service));
+			forEachConnector(c -> c.SetService(service));
+		} finally {
+			unlock();
 		}
-		this.service = service;
-		forEachAcceptor(a -> a.SetService(service));
-		forEachConnector(c -> c.SetService(service));
 	}
 
 	public void addConnector(@NotNull Connector connector) {

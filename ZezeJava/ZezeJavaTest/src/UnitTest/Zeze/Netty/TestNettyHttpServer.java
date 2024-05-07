@@ -9,6 +9,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
+import java.text.ParseException;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -224,7 +225,7 @@ public class TestNettyHttpServer {
 		Assert.assertTrue(checked.get());
 	}
 
-	public static void main(String[] args) throws InterruptedException {
+	public static void main(String[] args) throws Exception {
 		// ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
 		Task.tryInitThreadPool();
 
@@ -257,11 +258,34 @@ public class TestNettyHttpServer {
 					8192, TransactionLevel.Serializable, DispatchMode.Direct,
 					(x) -> {
 						var sb = new StringBuilder();
-						sb.append("uri=").append(x.request().uri()).append("\n");
-						sb.append("path=").append(x.path()).append("\n");
-						sb.append("query=").append(x.query()).append("\n");
-						for (var header : x.request().headers())
-							sb.append(header.getKey()).append("=").append(header.getValue()).append("\n");
+						var req = x.request();
+						assert req != null;
+						sb.append("remoteAddress: ").append(x.channel().remoteAddress()).append('\n');
+						sb.append("method: ").append(req.method()).append("\n");
+						sb.append("uri: ").append(req.uri()).append("\n");
+						sb.append("protocolVersion: ").append(req.protocolVersion()).append("\n");
+						sb.append("path: ").append(x.path()).append("\n");
+						sb.append("query: ").append(x.query()).append("\n");
+						sb.append("------\n");
+						for (var e : x.queryMap().entrySet())
+							sb.append(e.getKey()).append(": ").append(e.getValue()).append('\n');
+						sb.append("------\n");
+						for (var header : req.headers())
+							sb.append(header.getKey()).append(": ").append(header.getValue()).append("\n");
+						sb.append("------\n");
+						for (var cookie : x.getCookieList()) {
+							sb.append(cookie.name()).append(": ").append(cookie.value())
+									.append(", domain=").append(cookie.domain())
+									.append(", path=").append(cookie.path())
+									.append(", maxAge=").append(cookie.maxAge())
+									.append(", wrap=").append(cookie.wrap())
+									.append(", isSecure=").append(cookie.isSecure())
+									.append(", isHttpOnly=").append(cookie.isHttpOnly())
+									.append('\n');
+						}
+						sb.append("------\n");
+						sb.append("content.readableBytes: ").append(x.content().readableBytes()).append('\n');
+						x.addCookie("SESSIONID", "1234"); // set-cookie: SESSIONID=1234
 						x.sendPlainText(HttpResponseStatus.OK, sb.toString());
 					});
 			http.addHandler("/ex", // 抛异常
@@ -309,3 +333,23 @@ public class TestNettyHttpServer {
 		});
 	}
 }
+/*
+Nginx反向代理设置:
+http {
+    ......
+    upstream keepalive-upstream {
+        server 127.0.0.1:80;
+        keepalive 64;
+    }
+    server {
+        ......
+        location /hello {
+            proxy_pass http://keepalive-upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Real-Port $remote_port;
+        }
+    }
+}
+*/

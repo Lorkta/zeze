@@ -4,6 +4,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Builtin.Dbh2.BBucketMeta;
 import Zeze.Builtin.Dbh2.Commit.BPrepareBatches;
 import Zeze.Config;
@@ -25,12 +26,13 @@ import Zeze.Util.ShutdownHook;
 import Zeze.Util.Task;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * 这个类管理到桶的raft-client-agent。
  * 实际上不能算池子，一个桶目前考虑只建立一个实例，多线程使用时共享同一个实例。
  */
-public class Dbh2AgentManager {
+public class Dbh2AgentManager extends ReentrantLock {
 	private static final Logger logger = LogManager.getLogger(Dbh2AgentManager.class);
 	// 多master支持
 	private final ConcurrentHashMap<String, MasterAgent> masterAgent = new ConcurrentHashMap<>();
@@ -49,16 +51,20 @@ public class Dbh2AgentManager {
 	private final AbstractAgent serviceManager;
 	private final AutoKey tidAutoKey;
 
-	public synchronized void startRefreshMasterTable(
-			String masterName, String databaseName, String tableName) {
-		if (null != refreshMasterTableTask)
-			return;
+	public void startRefreshMasterTable(String masterName, String databaseName, String tableName) {
+		lock();
+		try {
+			if (null != refreshMasterTableTask)
+				return;
 
-		refreshMasterTableTask = Task.scheduleUnsafe(200,
-				() -> {
-					reload(openMasterAgent(masterName), masterName, databaseName, tableName);
-					refreshMasterTableTask = null;
-				});
+			refreshMasterTableTask = Task.scheduleUnsafe(200,
+					() -> {
+						reload(openMasterAgent(masterName), masterName, databaseName, tableName);
+						refreshMasterTableTask = null;
+					});
+		} finally {
+			unlock();
+		}
 	}
 
 	public Dbh2Config getDbh2Config() {
@@ -150,22 +156,27 @@ public class Dbh2AgentManager {
 		ShutdownHook.add(this, this::stop);
 	}
 
-	public synchronized void stop() throws Exception {
-		proxyAgent.stop();
-		for (var ma : masterAgent.values())
-			ma.stop();
-		masterAgent.clear();
-		for (var da : agents.values())
-			da.close();
-		agents.clear();
+	public void stop() throws Exception {
+		lock();
+		try {
+			proxyAgent.stop();
+			for (var ma : masterAgent.values())
+				ma.stop();
+			masterAgent.clear();
+			for (var da : agents.values())
+				da.close();
+			agents.clear();
 
-		if (null != commit) {
-			commit.stop();
-			commit = null;
-		}
-		if (null != commitAgent) {
-			commitAgent.stop();
-			commitAgent = null;
+			if (null != commit) {
+				commit.stop();
+				commit = null;
+			}
+			if (null != commitAgent) {
+				commitAgent.stop();
+				commitAgent = null;
+			}
+		} finally {
+			unlock();
 		}
 	}
 
@@ -253,48 +264,59 @@ public class Dbh2AgentManager {
 		});
 	}
 
-	public synchronized void reload(
+	public void reload(
 			MasterAgent masterAgent, String masterName,
 			String databaseName, String tableName) {
-		var masterTable = masterAgent.getBuckets(databaseName, tableName);
-		logger.info("reload ... {}", masterTable);
-		putBuckets(masterTable, masterName, databaseName, tableName);
+		lock();
+		try {
+			var masterTable = masterAgent.getBuckets(databaseName, tableName);
+			logger.info("reload ... {}", masterTable);
+			putBuckets(masterTable, masterName, databaseName, tableName);
+		} finally {
+			unlock();
+		}
 	}
 
-	public synchronized void putBuckets(
+	public void putBuckets(
 			MasterTable.Data buckets,
 			String masterName,
 			String databaseName,
 			String tableName) {
-		var master = this.buckets.computeIfAbsent(masterName, __ -> new ConcurrentHashMap<>());
-		var database = master.computeIfAbsent(databaseName, __ -> new ConcurrentHashMap<>());
-		var table = database.get(tableName);
-		if (table == null) {
-			database.put(tableName, buckets);
-			return;
-		}
-		var oldRaft = new HashSet<String>();
-		for (var bucket : table.buckets())
-			oldRaft.add(bucket.getRaftConfig());
-		for (var bucket : buckets.buckets())
-			oldRaft.remove(bucket.getRaftConfig());
-		for (var raft : oldRaft) {
-			var agent = agents.remove(raft);
-			if (null != agent) {
-				try {
-					agent.close();
-				} catch (Exception e) {
-					logger.error("", e);
+		lock();
+		try {
+			var master = this.buckets.computeIfAbsent(masterName, __ -> new ConcurrentHashMap<>());
+			var database = master.computeIfAbsent(databaseName, __ -> new ConcurrentHashMap<>());
+			var table = database.get(tableName);
+			if (table == null) {
+				database.put(tableName, buckets);
+				return;
+			}
+			var oldRaft = new HashSet<String>();
+			for (var bucket : table.buckets())
+				oldRaft.add(bucket.getRaftConfig());
+			for (var bucket : buckets.buckets())
+				oldRaft.remove(bucket.getRaftConfig());
+			for (var raft : oldRaft) {
+				var agent = agents.remove(raft);
+				if (null != agent) {
+					try {
+						agent.close();
+					} catch (Exception e) {
+						logger.error("", e);
+					}
 				}
 			}
+			database.put(tableName, buckets);
+		} finally {
+			unlock();
 		}
-		database.put(tableName, buckets);
 	}
 
 	public long walk(MasterAgent masterAgent,
 					 String masterName, String databaseName, String tableName,
 					 TableWalkHandleRaw callback,
-					 boolean desc) {
+					 boolean desc,
+					 @Nullable byte[] prefix) {
 		var table = buckets.get(masterName).get(databaseName).get(tableName);
 		var count = 0L;
 		for (var bucketIt = table.buckets().iterator(); bucketIt.hasNext(); /* nothing */) {
@@ -302,7 +324,7 @@ public class Dbh2AgentManager {
 			var proposeLimit = 5000;
 			var bucket = bucketIt.next();
 			while (true) {
-				var r = openBucket(bucket.getRaftConfig()).walk(exclusiveStartKey, proposeLimit, desc);
+				var r = openBucket(bucket.getRaftConfig()).walk(exclusiveStartKey, proposeLimit, desc, prefix);
 				// 处理错误：1. 需要处理分桶的拒绝；2. 其他错误抛出异常。
 				if (r.getResultCode() != 0)
 					throw new RuntimeException("walk result=" + IModule.getErrorCode(r.getResultCode()));
@@ -332,7 +354,8 @@ public class Dbh2AgentManager {
 						   String masterName, String databaseName, String tableName,
 						   ByteBuffer exclusiveStartKey, int proposeLimit,
 						   TableWalkHandleRaw callback,
-						   boolean desc) {
+						   boolean desc,
+						   @Nullable byte[] prefix) {
 		var exclusiveKey = exclusiveStartKey != null ? new Binary(exclusiveStartKey) : Binary.Empty;
 		var bucketIt = locateBucketIterator(masterAgent, masterName, databaseName, tableName, exclusiveKey);
 		if (!bucketIt.hasNext())
@@ -340,7 +363,7 @@ public class Dbh2AgentManager {
 		var bucket = bucketIt.next();
 		while (true) {
 			Binary lastKey = null;
-			var r = openBucket(bucket.getRaftConfig()).walk(exclusiveKey, proposeLimit, desc);
+			var r = openBucket(bucket.getRaftConfig()).walk(exclusiveKey, proposeLimit, desc, prefix);
 			// 处理错误：1. 需要处理分桶的拒绝；2. 其他错误抛出异常。
 			if (r.getResultCode() != 0)
 				throw new RuntimeException("walk result=" + IModule.getErrorCode(r.getResultCode()));
@@ -366,7 +389,8 @@ public class Dbh2AgentManager {
 	public long walkKey(MasterAgent masterAgent,
 						String masterName, String databaseName, String tableName,
 						TableWalkKeyRaw callback,
-						boolean desc) {
+						boolean desc,
+						@Nullable byte[] prefix) {
 		var table = buckets.get(masterName).get(databaseName).get(tableName);
 		var count = 0L;
 		for (var bucketIt = table.buckets().iterator(); bucketIt.hasNext(); /* nothing */) {
@@ -374,7 +398,7 @@ public class Dbh2AgentManager {
 			var proposeLimit = 5000;
 			var bucket = bucketIt.next();
 			while (true) {
-				var r = openBucket(bucket.getRaftConfig()).walkKey(exclusiveStartKey, proposeLimit, desc);
+				var r = openBucket(bucket.getRaftConfig()).walkKey(exclusiveStartKey, proposeLimit, desc, prefix);
 				// 处理错误：1. 需要处理分桶的拒绝；2. 其他错误抛出异常。
 				if (r.getResultCode() != 0)
 					throw new RuntimeException("walkKey result=" + IModule.getErrorCode(r.getResultCode()));
@@ -404,7 +428,8 @@ public class Dbh2AgentManager {
 							  String masterName, String databaseName, String tableName,
 							  ByteBuffer exclusiveStartKey, int proposeLimit,
 							  TableWalkKeyRaw callback,
-							  boolean desc) {
+							  boolean desc,
+							  @Nullable byte[] prefix) {
 		var exclusiveKey = exclusiveStartKey != null ? new Binary(exclusiveStartKey) : Binary.Empty;
 		var bucketIt = locateBucketIterator(masterAgent, masterName, databaseName, tableName, exclusiveKey);
 		if (!bucketIt.hasNext())
@@ -412,7 +437,7 @@ public class Dbh2AgentManager {
 		var bucket = bucketIt.next();
 		Binary lastKey = null;
 		while (true) {
-			var r = openBucket(bucket.getRaftConfig()).walkKey(exclusiveKey, proposeLimit, desc);
+			var r = openBucket(bucket.getRaftConfig()).walkKey(exclusiveKey, proposeLimit, desc, prefix);
 			// 处理错误：1. 需要处理分桶的拒绝；2. 其他错误抛出异常。
 			if (r.getResultCode() != 0)
 				throw new RuntimeException("walk result=" + IModule.getErrorCode(r.getResultCode()));

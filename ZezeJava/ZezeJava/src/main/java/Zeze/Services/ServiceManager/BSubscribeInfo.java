@@ -2,58 +2,79 @@ package Zeze.Services.ServiceManager;
 
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Serialize.IByteBuffer;
-import Zeze.Transaction.Bean;
+import Zeze.Serialize.Serializable;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
-public final class BSubscribeInfo extends Bean {
-	public static final int SubscribeTypeSimple = 0;
-	public static final int SubscribeTypeReadyCommit = 1;
+public final class BSubscribeInfo implements Serializable {
+	private @NotNull String serviceName;
+	private long version;
+	private transient @Nullable Object localState;
 
-	private String serviceName;
-	private int subscribeType; // 见上面定义的枚举
-	private Object localState;
+	public BSubscribeInfo(@NotNull IByteBuffer bb) {
+		serviceName = "";
+		decode(bb);
+	}
 
-	public String getServiceName() {
+	public BSubscribeInfo(@NotNull String name) {
+		this(name, 0, null);
+	}
+
+	public BSubscribeInfo(@NotNull String name, long version) {
+		this(name, version, null);
+	}
+
+	public BSubscribeInfo(@NotNull String name, long version, @Nullable Object state) {
+		serviceName = name;
+		this.version = version;
+		localState = state;
+	}
+
+	public @NotNull String getServiceName() {
 		return serviceName;
 	}
 
-	public void setServiceName(String value) {
-		serviceName = value;
+	public long getVersion() {
+		return version;
 	}
 
-	public int getSubscribeType() {
-		return subscribeType;
-	}
-
-	public void setSubscribeType(int value) {
-		subscribeType = value;
-	}
-
-	public Object getLocalState() {
+	public @Nullable Object getLocalState() {
 		return localState;
 	}
 
-	public void setLocalState(Object value) {
+	public void setLocalState(@Nullable Object value) {
 		localState = value;
 	}
 
 	@Override
-	public void decode(IByteBuffer bb) {
-		setServiceName(bb.ReadString());
-		setSubscribeType(bb.ReadInt());
+	public void decode(@NotNull IByteBuffer bb) {
+		serviceName = bb.ReadString();
+		version = bb.ReadLong();
 	}
 
 	@Override
-	public void encode(ByteBuffer bb) {
-		bb.WriteString(getServiceName());
-		bb.WriteInt(getSubscribeType());
+	public void encode(@NotNull ByteBuffer bb) {
+		bb.WriteString(serviceName);
+		bb.WriteLong(version);
 	}
 
 	@Override
-	public String toString() {
-		return getServiceName() + ":" + getSubscribeType();
+	public int hashCode() {
+		return serviceName.hashCode() * 31 + Long.hashCode(version);
 	}
 
-	private static int _PRE_ALLOC_SIZE_ = 16;
+	@Override
+	public boolean equals(@Nullable Object o) {
+		if (this == o)
+			return true;
+		if (o == null || getClass() != o.getClass())
+			return false;
+
+		var that = (BSubscribeInfo)o;
+		return version == that.version && serviceName.equals(that.serviceName);
+	}
+
+	private static int _PRE_ALLOC_SIZE_ = 32;
 
 	@Override
 	public int preAllocSize() {
@@ -63,5 +84,10 @@ public final class BSubscribeInfo extends Bean {
 	@Override
 	public void preAllocSize(int size) {
 		_PRE_ALLOC_SIZE_ = size;
+	}
+
+	@Override
+	public @NotNull String toString() {
+		return serviceName + ':' + version;
 	}
 }

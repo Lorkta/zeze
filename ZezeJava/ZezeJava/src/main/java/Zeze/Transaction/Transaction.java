@@ -3,12 +3,16 @@ package Zeze.Transaction;
 import java.util.ArrayList;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
+import Zeze.History.History;
 import Zeze.Onz.Onz;
 import Zeze.Onz.OnzProcedure;
 import Zeze.Services.GlobalCacheManagerConst;
+import Zeze.Services.ServiceManager.TidCache;
 import Zeze.Util.PerfCounter;
 import Zeze.Util.Random;
+import Zeze.Util.TaskCompletionSource;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
@@ -67,6 +71,8 @@ public final class Transaction {
 	private final ArrayList<Bean> redoBeans = new ArrayList<>();
 	private final ArrayList<Runnable> redoActions = new ArrayList<>();
 	private @Nullable OnzProcedure onzProcedure;
+	final Profiler profiler = new Profiler();
+	private TaskCompletionSource<TidCache> tidCacheFuture;
 
 	private Transaction() {
 	}
@@ -75,7 +81,8 @@ public final class Transaction {
 		return procedureStack;
 	}
 
-	@NotNull TreeMap<TableKey, RecordAccessed> getAccessedRecords() {
+	@NotNull
+	TreeMap<TableKey, RecordAccessed> getAccessedRecords() {
 		return accessedRecords;
 	}
 
@@ -107,8 +114,9 @@ public final class Transaction {
 		this.userState = userState;
 	}
 
-	private void reuseTransaction() {
-		// holdLocks.Clear(); // 执行完肯定清理了。
+	void reuseTransaction() {
+		// holdLocks.forEach(Lockey::exitLock);
+		// holdLocks.clear(); // 执行完肯定清理了。
 		procedureStack.clear();
 		logActions.clear();
 		savepoints.clear();
@@ -122,6 +130,26 @@ public final class Transaction {
 		redoBeans.clear();
 		redoActions.clear();
 		onzProcedure = null;
+		profiler.reset();
+		tidCacheFuture = null;
+	}
+
+	void reuseTransactionForRedo(@NotNull CheckResult checkResult) {
+		if (checkResult == CheckResult.RedoAndReleaseLock) {
+			holdLocks.forEach(Lockey::exitLock);
+			holdLocks.clear();
+		}
+		// retry 可能保持已有的锁，清除记录和保存点。
+		procedureStack.clear();
+		logActions.clear(); // retry 中间的日志不记录。
+		savepoints.clear();
+		actions.clear();
+		accessedRecords.clear();
+		state = TransactionState.Running; // prepare to retry
+		redoBeans.clear();
+		redoActions.clear();
+		// profiler.reset(); // 可以收集，区分？不同redo的信息，全部体现。
+		tidCacheFuture = null;
 	}
 
 	public void begin() {
@@ -166,6 +194,7 @@ public final class Transaction {
 	}
 
 	private void triggerRedoActions() {
+		profiler.onRedo();
 		redoBeans.forEach(Bean::resetRootInfo);
 		// 确认问题：
 		//  1. triggerRedoActions 上面两个分支调用，第一个分支异常，会导致catch里面再次执行。是不是应该吧两个调回统一到下面的for循环继续的地方？
@@ -243,10 +272,24 @@ public final class Transaction {
 									finalRollback(procedure);
 									return Procedure.ErrorSavepoint;
 								}
-								checkResult = lockAndCheck(procedure.getTransactionLevel());
+								checkResult = lockAndCheck(procedure);
 								if (checkResult == CheckResult.Success) {
 									if (result == Procedure.Success) {
-										finalCommit(procedure);
+										try {
+											finalCommit(procedure);
+										} catch (Exception ex) {
+											// final Commit 不能抛出异常。否则就halt。
+
+											// 首先释放锁
+											holdLocks.forEach(Lockey::exitLock);
+											holdLocks.clear();
+
+											// halt process.
+											procedure.getZeze().checkpointRun();
+											LogManager.shutdown();
+											Runtime.getRuntime().halt(543543);
+											return 0;
+										}
 										return Procedure.Success;
 									}
 									finalRollback(procedure, true);
@@ -289,7 +332,7 @@ public final class Transaction {
 									finalRollback(procedure);
 									throw (AssertionError)e;
 								}
-								checkResult = lockAndCheck(procedure.getTransactionLevel());
+								checkResult = lockAndCheck(procedure);
 								if (checkResult == CheckResult.Success) {
 									finalRollback(procedure, true);
 									return Procedure.Exception;
@@ -321,19 +364,7 @@ public final class Transaction {
 							triggerRedoActions();
 							// retry
 						} finally {
-							if (checkResult == CheckResult.RedoAndReleaseLock) {
-								holdLocks.forEach(Lockey::exitLock);
-								holdLocks.clear();
-							}
-							// retry 可能保持已有的锁，清除记录和保存点。
-							accessedRecords.clear();
-							savepoints.clear();
-							actions.clear();
-							redoBeans.clear();
-							redoActions.clear();
-							logActions.clear(); // retry 中间的日志不记录。
-
-							state = TransactionState.Running; // prepare to retry
+							reuseTransactionForRedo(checkResult);
 						}
 
 						if (checkResult == CheckResult.RedoAndReleaseLock) {
@@ -398,7 +429,16 @@ public final class Transaction {
 		this.onzProcedure = onzProcedure;
 	}
 
-	private void finalCommit(@NotNull Procedure procedure) {
+	private void finalCommit(@NotNull Procedure procedure) throws Exception {
+		final long tid;
+		if (tidCacheFuture != null) {
+			tid = tidCacheFuture.get().next();
+			for (var e : accessedRecords.entrySet())
+				e.getValue().atomicTupleRecord.record.setTid(tid);
+		} else {
+			tid = 0;
+		}
+
 		// onz patch: onz事务执行阶段的2段式同步等待。
 		OnzProcedure flushMode = null; // 即使当前是Onz事务，也要根据flushMode决定是否继续传递参数给flush过程。
 		if (null != onzProcedure) {
@@ -409,8 +449,10 @@ public final class Transaction {
 		// 下面不允许失败了，因为最终提交失败，数据可能不一致，而且没法恢复。
 		// 可以在最终提交里可以实现每事务checkpoint。
 		procedure.getZeze().getProcedureLockWatcher().doWatch(procedure, accessedRecords);
-
 		var lastSp = savepoints.get(savepoints.size() - 1);
+
+		// collect logs and notify listeners
+		var cc = new Changes(this);
 		RelativeRecordSet.tryUpdateAndCheckpoint(this, procedure, () -> {
 			try {
 				lastSp.mergeCommitActions(actions);
@@ -437,19 +479,7 @@ public final class Transaction {
 				LogManager.shutdown();
 				Runtime.getRuntime().halt(54321);
 			}
-		}, flushMode); // onz patch: 新增参数
-
-		// 禁止在listener回调中访问表格的操作。除了回调参数中给定的记录可以访问。
-		// 不再支持在回调中再次执行事务。
-		// 在Notify之前设置的。
-		state = TransactionState.Completed;
-
-		try {
-			for (var act : logActions)
-				act.run();
-
-			// collect logs and notify listeners
-			var cc = new Changes(this);
+		}, flushMode, () -> {
 			var it = lastSp.logIterator();
 			if (it != null) {
 				while (it.moveToNext()) {
@@ -467,8 +497,28 @@ public final class Transaction {
 				if (ar.dirty)
 					cc.collectRecord(ar);
 			}
-			cc.notifyListener();
 
+			// >>>>>>>>
+			// for debug. remove later.
+			if (!cc.getRecords().isEmpty() && tidCacheFuture == null)
+				logger.fatal("history lost. ++++++++");
+			// <<<<<<<<
+
+			if (tidCacheFuture != null)
+				return History.buildLogChanges(tid, cc,
+						procedure.getProtocolClassName(), procedure.getProtocolRawArgument());
+			return null;
+		}); // onz patch: 新增参数
+
+		// 禁止在listener回调中访问表格的操作。除了回调参数中给定的记录可以访问。
+		// 不再支持在回调中再次执行事务。
+		// 在Notify之前设置的。
+		state = TransactionState.Completed;
+
+		try {
+			for (var act : logActions)
+				act.run();
+			cc.notifyListener();
 			triggerCommitActions(procedure);
 		} catch (Throwable ex) { // logger.error
 			logger.error("finalCommit({}) exception:", procedure, ex);
@@ -563,7 +613,7 @@ public final class Transaction {
 		RedoAndReleaseLock
 	}
 
-	private static @NotNull CheckResult _check_(boolean writeLock, @NotNull RecordAccessed e) {
+	private @NotNull CheckResult _check_(Procedure procedure, boolean writeLock, @NotNull RecordAccessed e) {
 		e.atomicTupleRecord.record.enterFairLock();
 		try {
 			if (writeLock) {
@@ -576,14 +626,26 @@ public final class Transaction {
 					return CheckResult.RedoAndReleaseLock; // 写锁发现Invalid，可能有Reduce请求。
 
 				case GlobalCacheManagerConst.StateModify:
-					return e.atomicTupleRecord.timestamp != e.atomicTupleRecord.record.getTimestamp() ? CheckResult.Redo : CheckResult.Success;
+					if (tidCacheFuture == null) // modify 命中，尝试使用当前的cache。
+						tidCacheFuture = procedure.getZeze().getServiceManager().getLastTidCacheFuture();
+					return e.atomicTupleRecord.timestamp != e.atomicTupleRecord.record.getTimestamp()
+							? CheckResult.Redo : CheckResult.Success;
 
 				case GlobalCacheManagerConst.StateShare:
 					// 这里可能死锁：另一个先获得提升的请求要求本机Reduce，但是本机Checkpoint无法进行下去，被当前事务挡住了。
 					// 通过 GlobalCacheManager 检查死锁，返回失败;需要重做并释放锁。
+					tidCacheFuture = procedure.getZeze().getServiceManager().allocateTidCacheFuture(
+							procedure.getZeze().getConfig().getHistory());
 					var acquire = e.atomicTupleRecord.record.acquire(GlobalCacheManagerConst.StateModify,
 							e.atomicTupleRecord.record.isFresh(), false);
+					// acquire 比 allocate 慢，此时future结果应已返回，至少绝大多数情况下都已返回。
+					var startTid = tidCacheFuture.get().getStart();
 					//noinspection DataFlowIssue
+					if (acquire.reducedTid > startTid) {
+						tidCacheFuture = procedure.getZeze().getServiceManager().allocateTidCacheFuture(
+								procedure.getZeze().getConfig().getHistory()
+						);
+					}
 					if (acquire.resultState != GlobalCacheManagerConst.StateModify) {
 						e.atomicTupleRecord.record.setNotFresh(); // 抢失败不再新鲜。
 						logger.debug("Acquire Failed. Maybe DeadLock Found: record={}, time={}",
@@ -592,10 +654,14 @@ public final class Transaction {
 						return CheckResult.RedoAndReleaseLock;
 					}
 					e.atomicTupleRecord.record.setState(GlobalCacheManagerConst.StateModify);
-					return e.atomicTupleRecord.timestamp != e.atomicTupleRecord.record.getTimestamp() ? CheckResult.Redo : CheckResult.Success;
+					return e.atomicTupleRecord.timestamp != e.atomicTupleRecord.record.getTimestamp()
+							? CheckResult.Redo : CheckResult.Success;
 				}
-				return e.atomicTupleRecord.timestamp != e.atomicTupleRecord.record.getTimestamp() ? CheckResult.Redo : CheckResult.Success; // impossible
+				return e.atomicTupleRecord.timestamp != e.atomicTupleRecord.record.getTimestamp()
+						? CheckResult.Redo : CheckResult.Success; // impossible
 			}
+
+			// read lock
 			switch (e.atomicTupleRecord.record.getState()) {
 			case GlobalCacheManagerConst.StateRemoved:
 				// 被从cache中清除，不持有该记录的Global锁，简单重做即可。
@@ -604,25 +670,28 @@ public final class Transaction {
 			case GlobalCacheManagerConst.StateInvalid:
 				return CheckResult.RedoAndReleaseLock; // 发现Invalid，可能有Reduce请求或者被Cache清理，此时保险起见释放锁。
 			}
-			return e.atomicTupleRecord.timestamp != e.atomicTupleRecord.record.getTimestamp() ? CheckResult.Redo : CheckResult.Success;
+			return e.atomicTupleRecord.timestamp != e.atomicTupleRecord.record.getTimestamp()
+					? CheckResult.Redo : CheckResult.Success;
 		} finally {
 			e.atomicTupleRecord.record.exitFairLock();
 		}
 	}
 
-	@NotNull Lockey getLockey(TableKey key) {
+	@NotNull
+	Lockey getLockey(TableKey key) {
 		return locks.get(key);
 	}
 
-	private @NotNull CheckResult lockAndCheck(@NotNull Map.Entry<TableKey, RecordAccessed> e) {
+	private @NotNull CheckResult lockAndCheck(Procedure procedure, @NotNull Map.Entry<TableKey, RecordAccessed> e) {
 		Lockey lockey = getLockey(e.getKey());
 		boolean writeLock = e.getValue().dirty;
 		lockey.enterLock(writeLock);
 		holdLocks.add(lockey);
-		return _check_(writeLock, e.getValue());
+		return _check_(procedure, writeLock, e.getValue());
 	}
 
-	private @NotNull CheckResult lockAndCheck(TransactionLevel level) {
+	private @NotNull CheckResult lockAndCheck(Procedure procedure) {
+		var level = procedure.getTransactionLevel();
 		boolean allRead = true;
 		var saveSize = savepoints.size();
 		if (saveSize > 0) {
@@ -658,7 +727,7 @@ public final class Transaction {
 		boolean conflict = false; // 冲突了，也继续加锁，为重做做准备！！！
 		if (holdLocks.isEmpty()) {
 			for (var e : accessedRecords.entrySet()) {
-				var r = lockAndCheck(e);
+				var r = lockAndCheck(procedure, e);
 				switch (r) {
 				case Success:
 					break;
@@ -679,7 +748,7 @@ public final class Transaction {
 		while (null != e) {
 			// 如果 holdLocks 全部被对比完毕，直接锁定它
 			if (index >= n) {
-				var r = lockAndCheck(e);
+				var r = lockAndCheck(procedure, e);
 				switch (r) {
 				case Success:
 					break;
@@ -709,7 +778,7 @@ public final class Transaction {
 					continue;
 				}
 				// BUG 即使锁内。Record.Global.State 可能没有提升到需要水平。需要重新_check_。
-				var r = _check_(e.getValue().dirty, e.getValue());
+				var r = _check_(procedure, e.getValue().dirty, e.getValue());
 				switch (r) {
 				case Success:
 					// 已经锁内，所以肯定不会冲突，多数情况是这个。

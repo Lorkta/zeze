@@ -191,14 +191,24 @@ public class Online extends AbstractOnline implements HotUpgrade {
 			hotManager.addHotUpgrade(this);
 	}
 
-	public synchronized void setLocalActiveTimeout(long timeout) {
-		localActiveTimeout = timeout;
+	public void setLocalActiveTimeout(long timeout) {
+		lock();
+		try {
+			localActiveTimeout = timeout;
+		} finally {
+			unlock();
+		}
 	}
 
-	public synchronized void setLocalCheckPeriod(long period) {
-		if (period <= 1)
-			throw new IllegalArgumentException();
-		localCheckPeriod = period;
+	public void setLocalCheckPeriod(long period) {
+		lock();
+		try {
+			if (period <= 1)
+				throw new IllegalArgumentException();
+			localCheckPeriod = period;
+		} finally {
+			unlock();
+		}
 	}
 
 	private void startLocalCheck() {

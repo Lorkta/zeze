@@ -10,8 +10,11 @@
 	<external bean="Zeze.Services.ServiceManager.BServerLoad"/>
 	<external bean="Zeze.Services.ServiceManager.BServiceInfo"/>
 	<external bean="Zeze.Services.ServiceManager.BServiceInfos"/>
-	<external bean="Zeze.Services.ServiceManager.BServiceListVersion"/>
 	<external bean="Zeze.Services.ServiceManager.BSubscribeInfo"/>
+	<external bean="Zeze.Services.ServiceManager.BEditService"/>
+	<external bean="Zeze.Services.ServiceManager.BSubscribeArgument"/>
+	<external bean="Zeze.Services.ServiceManager.BUnSubscribeArgument"/>
+	<external bean="Zeze.Services.ServiceManager.BSubscribeResult"/>
 
 	<module name="Builtin" id="11000">
 		<!-- Global With Raft 模块 -->
@@ -39,6 +42,7 @@
 			<bean name="BReduceParam">
 				<variable id="1" name="GlobalKey" type="binary"/>
 				<variable id="2" name="State" type="int"/>
+				<variable id="3" name="ReduceTid" type="long"/>
 			</bean>
 
 			<bean name="BLoginParam">
@@ -344,12 +348,6 @@
 				<enum name="ConfigTypeDynamic" value="2"/>
 
 				<variable name="ConfigType" id="2" type="int"/>
-
-				<!-- SubscribeType
-				定义于： Zeze.Services.ServiceManager.BSubscribeInfo.
-				静态绑定忽略这个参数，总是使用Zeze.Services.ServiceManager.SubscribeInfo.SubscribeTypeReadyCommit.
-				-->
-				<variable name="SubscribeType" id="3" type="int"/>
 			</bean>
 
 			<bean name="BBind">
@@ -1105,34 +1103,18 @@
 			<rpc name="Login" argument="BLogin" base="Zeze.Raft.RaftRpc" handle="server"/>
 
 			<rpc name="AllocateId" argument="Zeze.Services.ServiceManager.BAllocateIdArgument" result="Zeze.Services.ServiceManager.BAllocateIdResult" base="Zeze.Raft.RaftRpc" handle="server"/>
-			<rpc name="CommitServiceList" argument="Zeze.Services.ServiceManager.BServiceListVersion" base="Zeze.Raft.RaftRpc" handle="client"/>
 			<rpc name="KeepAlive" base="Zeze.Raft.RaftRpc" handle="client"/>
-			<rpc name="NotifyServiceList" argument="Zeze.Services.ServiceManager.BServiceInfos" base="Zeze.Raft.RaftRpc" handle="client"/>
 			<rpc name="OfflineNotify" argument="Zeze.Services.ServiceManager.BOfflineNotify" base="Zeze.Raft.RaftRpc" handle="client"/>
 			<rpc name="OfflineRegister" argument="Zeze.Services.ServiceManager.BOfflineNotify" base="Zeze.Raft.RaftRpc" handle="server"/>
-			<rpc name="ReadyServiceList" argument="Zeze.Services.ServiceManager.BServiceListVersion" base="Zeze.Raft.RaftRpc" handle="server"/>
-			<rpc name="Register" argument="Zeze.Services.ServiceManager.BServiceInfo" base="Zeze.Raft.RaftRpc" handle="server,client">
-				<enum name="Success" value="0"/>
-				<enum name="DuplicateRegister" value="1"/>
-			</rpc>
+			<rpc name="Edit" argument="Zeze.Services.ServiceManager.BEditService" base="Zeze.Raft.RaftRpc" handle="server,client"/>
 			<rpc name="SetServerLoad" argument="Zeze.Services.ServiceManager.BServerLoad" base="Zeze.Raft.RaftRpc" handle="server,client"/>
-			<rpc name="Subscribe" argument="Zeze.Services.ServiceManager.BSubscribeInfo" base="Zeze.Raft.RaftRpc" handle="server">
+			<rpc name="Subscribe" argument="Zeze.Services.ServiceManager.BSubscribeArgument" result="Zeze.Services.ServiceManager.BSubscribeResult" base="Zeze.Raft.RaftRpc" handle="server">
 				<enum name="Success" value="0"/>
 				<enum name="DuplicateSubscribe" value="1"/>
-				<enum name="UnknownSubscribeType" value="2"/>
 			</rpc>
-			<rpc name="SubscribeFirstCommit" argument="Zeze.Services.ServiceManager.BServiceInfos" base="Zeze.Raft.RaftRpc" handle="client"/>
-			<rpc name="UnRegister" argument="Zeze.Services.ServiceManager.BServiceInfo" base="Zeze.Raft.RaftRpc" handle="server,client"/>
-			<rpc name="UnSubscribe" argument="Zeze.Services.ServiceManager.BSubscribeInfo" base="Zeze.Raft.RaftRpc" handle="server">
+			<rpc name="UnSubscribe" argument="Zeze.Services.ServiceManager.BUnSubscribeArgument" base="Zeze.Raft.RaftRpc" handle="server">
 				<enum name="Success" value="0"/>
 				<enum name="NotExist" value="1"/>
-			</rpc>
-			<rpc name="Update" argument="Zeze.Services.ServiceManager.BServiceInfo" base="Zeze.Raft.RaftRpc" handle="server,client">
-				<enum name="Success" value="0"/>
-				<enum name="ServiceNotRegister" value="1"/>
-				<enum name="ServerStateError" value="2"/>
-				<enum name="ServiceIdentityNotExist" value="3"/>
-				<enum name="ServiceNotSubscribe" value="4"/>
 			</rpc>
 			<rpc name="NormalClose" base="Zeze.Raft.RaftRpc" handle="server"/>
 
@@ -1167,10 +1149,11 @@
 				<variable id="4" name="PassivePort" type="int"/>
 				<variable id="5" name="ExtraInfo" type="binary"/>
 				<variable id="6" name="SessionName" type="string"/>
+				<variable id="7" name="Version" type="long"/>
 			</bean>
 			<bean name="BSubscribeInfoRocks" kind="rocks">
 				<variable id="1" name="ServiceName" type="string"/>
-				<variable id="2" name="SubscribeType" type="int"/>
+				<variable id="2" name="Version" type="long"/>
 			</bean>
 			<table name="tSession" key="string" value="BSession" kind="rocks"/>
 
@@ -1181,15 +1164,14 @@
 			<table name="tLoadObservers" key="string" value="BLoadObservers" kind="rocks"/>
 
 			<!-- service(server state) -->
+			<bean name="BServiceInfosVersionRocks" kind="rocks">
+				<variable id="1" name="ServiceInfos" type="map[string, BServiceInfoRocks]"/>
+			</bean>
 			<bean name="BServerState" kind="rocks">
 				<variable id="1" name="ServiceName" type="string"/>
-				<variable id="2" name="ServiceInfos" type="map[string, BServiceInfoRocks]"/>
-				<variable id="3" name="Simple" type="map[string, BSubscribeStateRocks]"/>
-				<variable id="4" name="ReadyCommit" type="map[string, BSubscribeStateRocks]"/>
+				<variable id="2" name="ServiceInfosVersion" type="map[long, BServiceInfosVersionRocks]"/>
+				<variable id="3" name="Simple" type="map[string, BSubscribeInfoRocks]"/>
 				<variable id="5" name="SerialId" type="long"/>
-			</bean>
-			<bean name="BSubscribeStateRocks" kind="rocks">
-				<variable id="1" name="Ready" type="bool"/>
 			</bean>
 			<table name="tServerState" key="string" value="BServerState" kind="rocks"/>
 		</module>
@@ -1408,6 +1390,7 @@
 				<variable id="1" name="ExclusiveStartKey" type="binary"/>
 				<variable id="2" name="ProposeLimit" type="int"/>
 				<variable id="3" name="Desc" type="bool"/>
+				<variable id="4" name="Prefix" type="binary"/>
 			</bean>
 			<bean name="BWalkKeyValue">
 				<variable id="1" name="Key" type="binary"/>
@@ -1570,7 +1553,16 @@
 			<enum name="eMd5Mismatch"  value="4"/> 关闭文件时，验证md5失败
 			<enum name="eServiceOldExists"  value="5"/> 发布更新服务时，发现备份目录存在
 			<enum name="eMoveOldFail"  value="6"/> 发布更新服务时，备份失败
-			<enum name="eCommitFail"  value="7"/> 发布更新服务时，发布服务失败
+
+			<!-- 作为错误码，同时也作为状态 -->
+			<enum name="eIdle"  value="0"/>
+			<enum name="ePrepare"  value="7"/>
+			<enum name="eTryDistribute"  value="8"/>
+			<enum name="eCommit"  value="9"/>
+			<enum name="eCommit2"  value="10"/>
+			<enum name="eDistributeIdMismatch"  value="11"/>
+			<enum name="eTryRollback"  value="12"/>
+			<enum name="eInstall"  value="13"/>
 
 			<bean name="BOpenFile">
 				<variable id="1" name="FileName" type="string"/>
@@ -1591,15 +1583,23 @@
 			</bean>
 			<bean name="BCloseFileResult">
 			</bean>
-			<bean name="BCommit">
+			<bean name="BDistributeId">
+				<variable id="1" name="DistributeId" type="long"/>
 			</bean>
-			<bean name="BCommitResult">
+			<bean name="BTryDistribute">
+				<variable id="1" name="DistributeId" type="long"/>
+				<variable id="2" name="AtomicAll" type="bool"/>
 			</bean>
 
 			<rpc name="OpenFile" argument="BOpenFile" result="BOpenFileResult" handle="server"/>
 			<rpc name="AppendFile" argument="BAppendFile" result="BAppendFileResult"  handle="server"/>
 			<rpc name="CloseFile" argument="BCloseFile" result="BCloseFileResult"  handle="server"/>
-			<rpc name="Commit" argument="BCommit" result="BCommitResult"  handle="server"/>
+
+			<rpc name="PrepareDistribute" argument="BDistributeId" handle="server"/>
+			<rpc name="TryDistribute" argument="BTryDistribute" handle="server"/>
+			<rpc name="Commit" argument="BDistributeId" handle="server"/>
+			<rpc name="Commit2" argument="BDistributeId" handle="server"/>
+			<rpc name="TryRollback" argument="BDistributeId" handle="server"/>
 		</module>
 
 		<module name="LogService" id="11035" UseData="true"  DefaultTransactionLevel="None">
@@ -1833,13 +1833,52 @@
 			<rpc name="Checkpoint" handle="server"/>
 		</module>
 
+		<module name="HttpSession" id="11018">
+			<bean name="BSessionValue">
+				<variable id="1" name="CreateTime" type="long"/>
+				<variable id="2" name="ExpireTime" type="long"/>
+				<variable id="3" name="Properties" type="map[string, string]"/>
+			</bean>
+			<table name="tSession" key="string" value="BSessionValue"/> key is http sessionid from cookie
+		</module>
+		
+		<module name="HistoryModule" id="11031" UseData="true">
+			<beankey name="BTableKey">
+				<variable id="1" name="TableId" type="int"/>
+				<variable id="2" name="KeyEncoded" type="binary"/>
+			</beankey>
+			<bean name="BLogChanges">
+				<variable id="1" name="GlobalSerialId" type="long"/>
+				<variable id="2" name="ProtocolClassName" type="string"/>
+				<variable id="3" name="ProtocolArgument" type="binary"/>
+				<variable id="4" name="Changes" type="map[BTableKey, binary]"/>
+				<variable id="5" name="Timestamp" type="long"/>
+			</bean>
+			<table name="ZezeHistoryTable_m_a_g_i_c" key="long" value="BLogChanges"/>
+
+			<!-- 查询分析 servlet -->
+			<servlet name="WalkPage" TransactionLevel="None"/>
+		</module>
+
 		<!--
-		可用id范围 11018, 11031, 11032, [11039, 11100) [11102, 11999]
+		可用id范围 11032, [11039, 11100) [11102, 11999]
 		-->
 
 	</module> Builtin
 
 	<!--++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-->
+	<component name="HistoryModule" gendir="src/main/java" genrelativedir="Zeze/History" platform="zeze+java">
+		<service name="" handle="server,servlet">
+			<module ref="Zeze.Builtin.HistoryModule"/>
+		</service>
+	</component>
+
+	<component name="HttpSession" gendir="src/main/java" genrelativedir="Zeze/Netty" platform="zeze+java">
+		<service name="" handle="server">
+			<module ref="Zeze.Builtin.HttpSession"/>
+		</service>
+	</component>
+
 	<component name="Onz" gendir="src/main/java" genrelativedir="Zeze/Onz" platform="zeze+java">
 		<service name="" handle="server">
 			<module ref="Zeze.Builtin.Onz"/>

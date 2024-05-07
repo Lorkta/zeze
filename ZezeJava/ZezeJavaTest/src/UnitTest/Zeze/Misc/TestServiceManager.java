@@ -1,7 +1,5 @@
 package UnitTest.Zeze.Misc;
 
-import java.nio.charset.StandardCharsets;
-import Zeze.Net.Binary;
 import Zeze.Services.ServiceManager.BServerLoad;
 import Zeze.Services.ServiceManager.BServiceInfo;
 import Zeze.Services.ServiceManager.BServiceInfos;
@@ -16,11 +14,18 @@ import org.junit.Test;
 public class TestServiceManager {
 	@Test
 	public void testServiceInfos() {
-		var infos = new BServiceInfos("TestBase");
-		infos.insert(new BServiceInfo("TestBase", "1"));
-		infos.insert(new BServiceInfo("TestBase", "3"));
-		infos.insert(new BServiceInfo("TestBase", "2"));
-		Assert.assertEquals("TestBase Version=0[1,2,3,]", infos.toString());
+		var infos = new BServiceInfos();
+		infos.insert(new BServiceInfo("TestBase", "1", 0));
+		infos.insert(new BServiceInfo("TestBase", "3", 0));
+		infos.insert(new BServiceInfo("TestBase", "2", 0));
+		var it = infos.getSortedIdentities().iterator();
+		Assert.assertTrue(it.hasNext());
+		Assert.assertEquals("1", it.next().getServiceIdentity());
+		Assert.assertTrue(it.hasNext());
+		Assert.assertEquals("2", it.next().getServiceIdentity());
+		Assert.assertTrue(it.hasNext());
+		Assert.assertEquals("3", it.next().getServiceIdentity());
+		Assert.assertFalse(it.hasNext());
 	}
 
 	@Before
@@ -44,24 +49,16 @@ public class TestServiceManager {
 		future = new TaskCompletionSource<>();
 
 		var agent = App.Instance.Zeze.getServiceManager();
-		agent.registerService(serviceName, "1", "127.0.0.1", 1234);
+		agent.registerService(new BServiceInfo(serviceName, "1", 0, "127.0.0.1", 1234));
 		agent.setOnChanged((state) -> {
-			System.out.println("OnChanged: " + state.getServiceInfos());
+			System.out.println("OnChanged 1:" + state);
 			this.future.setResult(0);
-		});
-		agent.setOnPrepare((state) -> {
-			var pending = state.getServiceInfosPending();
-			if (null != pending) {
-				for (var service : pending.getServiceInfoListSortedByIdentity()) {
-					state.setServiceIdentityReadyState(service.getServiceIdentity(), "");
-				}
-			}
 		});
 		agent.setOnSetServerLoad((load) -> {
 			System.out.println("OnSetLoad " + load);
 			this.future.setResult(0);
 		});
-		agent.subscribeService(serviceName, BSubscribeInfo.SubscribeTypeSimple);
+		agent.subscribeService(new BSubscribeInfo(serviceName));
 		var load = new BServerLoad();
 		load.ip = "127.0.0.1";
 		load.port = 1234;
@@ -69,39 +66,22 @@ public class TestServiceManager {
 		agent.setServerLoad(load);
 		future.await();
 
-		future = new TaskCompletionSource<>();
-		agent.setOnUpdate((state, info) -> {
-			System.out.println("OnUpdate: " + info);
-			this.future.setResult(0);
-		});
-		System.out.println("WaitOnUpdate");
-		agent.updateService(serviceName, "1", "1.1.1.1", 1, new Binary("extra info".getBytes(StandardCharsets.UTF_8)));
-		future.await();
-
 		System.out.println("RegisterService 2");
 		future = new TaskCompletionSource<>();
 		System.out.println("WaitOnChanged 2");
-		agent.registerService(serviceName, "2");
-		future.await();
-
-		// 改变订阅类型
-		System.out.println("Change Subscribe type");
-		agent.unSubscribeService(serviceName);
-		future = new TaskCompletionSource<>();
-		System.out.println("WaitOnChanged When Re-SubscribeService");
-		agent.subscribeService(serviceName, BSubscribeInfo.SubscribeTypeReadyCommit);
+		agent.registerService(new BServiceInfo(serviceName, "2"));
 		future.await();
 
 		var state = agent.getSubscribeStates().get(serviceName);
 		Object anyState = this;
-		state.setServiceIdentityReadyState("1", anyState);
-		state.setServiceIdentityReadyState("2", anyState);
-		state.setServiceIdentityReadyState("3", anyState);
+		state.setIdentityLocalState("1", anyState);
+		state.setIdentityLocalState("2", anyState);
+		state.setIdentityLocalState("3", anyState);
 
 		System.out.println("RegisterService 3");
 		future = new TaskCompletionSource<>();
 		System.out.println("WaitOnChanged 3");
-		agent.registerService(serviceName, "3");
+		agent.registerService(new BServiceInfo(serviceName, "3"));
 		future.await();
 	}
 }

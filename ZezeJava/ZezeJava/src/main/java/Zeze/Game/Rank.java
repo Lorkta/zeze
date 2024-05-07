@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collection;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.IntUnaryOperator;
 import java.util.function.LongUnaryOperator;
 import Zeze.AppBase;
@@ -18,6 +19,7 @@ import Zeze.Builtin.Game.Rank.BConcurrentKey;
 import Zeze.Builtin.Game.Rank.BRankList;
 import Zeze.Builtin.Game.Rank.BRankValue;
 import Zeze.Net.Binary;
+import Zeze.Services.ServiceManager.BServiceInfo;
 import Zeze.Util.OutObject;
 
 public class Rank extends AbstractRank {
@@ -57,7 +59,8 @@ public class Rank extends AbstractRank {
 	public void Start(String serviceNamePrefix, String providerDirectIp, int providerDirectPort) {
 		var name = ProviderDistribute.makeServiceName(serviceNamePrefix, getId());
 		var identity = String.valueOf(app.getZeze().getConfig().getServerId());
-		app.getZeze().getServiceManager().registerService(name, identity, providerDirectIp, providerDirectPort);
+		app.getZeze().getServiceManager().registerService(new BServiceInfo(
+				name, identity, app.getZeze().getConfig().getAppVersion(), providerDirectIp, providerDirectPort));
 	}
 
 	public static BConcurrentKey newRankKey(int rankType, int timeType) {
@@ -258,19 +261,22 @@ public class Rank extends AbstractRank {
 		return result;
 	}
 
-	public static class RankTotal {
+	public static class RankTotal extends ReentrantLock {
 		private long BuildTime;
 		private BRankList TableValue;
 
 		public final long getBuildTime() {
 			return BuildTime;
 		}
+
 		public final void setBuildTime(long value) {
 			BuildTime = value;
 		}
+
 		public final BRankList getTableValue() {
 			return TableValue;
 		}
+
 		public final void setTableValue(BRankList value) {
 			TableValue = value;
 		}
@@ -284,7 +290,8 @@ public class Rank extends AbstractRank {
 
 	public RankTotal getRankTotal(BConcurrentKey keyHint, int countNeed) throws Exception {
 		var rank = rankCached.computeIfAbsent(keyHint, __ -> new RankTotal());
-		synchronized (rank) {
+		rank.lock();
+		try {
 			long now = System.currentTimeMillis();
 			if (now - rank.getBuildTime() < getRankCacheTimeout(keyHint.getRankType())) {
 				return rank;
@@ -329,6 +336,8 @@ public class Rank extends AbstractRank {
 				}
 			}).await();
 			return rank;
+		} finally {
+			rank.unlock();
 		}
 	}
 
@@ -368,7 +377,7 @@ public class Rank extends AbstractRank {
 		// 判断是否在版内，并且得到排名位置。
 		var position = 0;
 		for (var r : total.getTableValue().getRankList()) {
-			position ++;
+			position++;
 			if (r.getRoleId() == roleId) {
 				return position;
 			}

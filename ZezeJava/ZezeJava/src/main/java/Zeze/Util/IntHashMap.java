@@ -330,7 +330,8 @@ public class IntHashMap<V> implements Cloneable {
 	}
 
 	public interface IntObjectFunction<V> {
-		@Nullable V apply(int key, V value);
+		@Nullable
+		V apply(int key, V value);
 	}
 
 	public V compute(int key, @NotNull IntObjectFunction<V> op) {

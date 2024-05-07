@@ -1,9 +1,6 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using Zeze.Gen.Types;
 
 namespace Zeze.Gen.rrjava
 {
@@ -25,20 +22,28 @@ namespace Zeze.Gen.rrjava
             }
             sw.WriteLine(prefix + "@Override");
             sw.WriteLine(prefix + "public void followerApply(Zeze.Raft.RocksRaft.Log log) {");
-            sw.WriteLine(prefix + "    var vars = ((Zeze.Raft.RocksRaft.LogBean)log).getVariables();");
-            sw.WriteLine(prefix + "    if (vars == null)");
-            sw.WriteLine(prefix + "        return;");
-            sw.WriteLine(prefix + "    for (var it = vars.iterator(); it.moveToNext(); ) {");
-            sw.WriteLine(prefix + "        var vlog = it.value();");
-            sw.WriteLine(prefix + "        switch (vlog.getVariableId()) {");
+            var hasVar = false;
             foreach (var v in bean.Variables)
             {
                 if (v.Transient)
                     continue;
+                if (!hasVar)
+                {
+                    hasVar = true;
+                    sw.WriteLine(prefix + "    var vars = ((Zeze.Raft.RocksRaft.LogBean)log).getVariables();");
+                    sw.WriteLine(prefix + "    if (vars == null)");
+                    sw.WriteLine(prefix + "        return;");
+                    sw.WriteLine(prefix + "    for (var it = vars.iterator(); it.moveToNext(); ) {");
+                    sw.WriteLine(prefix + "        var vlog = it.value();");
+                    sw.WriteLine(prefix + "        switch (vlog.getVariableId()) {");
+                }
                 v.VariableType.Accept(new FollowerApply(v, sw, prefix + "        "));
             }
-            sw.WriteLine(prefix + "        }");
-            sw.WriteLine(prefix + "    }");
+            if (hasVar)
+            {
+                sw.WriteLine(prefix + "        }");
+                sw.WriteLine(prefix + "    }");
+            }
             sw.WriteLine(prefix + "}");
         }
 
@@ -143,6 +148,11 @@ namespace Zeze.Gen.rrjava
         }
 
         public void Visit(Types.TypeVector4 type)
+        {
+            sw.WriteLine(prefix + $"    case {var.Id}: {var.NamePrivate} = (({Property.GetLogName(type)})vlog).value; break;");
+        }
+
+        public void Visit(TypeDecimal type)
         {
             sw.WriteLine(prefix + $"    case {var.Id}: {var.NamePrivate} = (({Property.GetLogName(type)})vlog).value; break;");
         }

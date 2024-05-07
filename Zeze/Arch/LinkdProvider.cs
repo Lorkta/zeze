@@ -11,7 +11,7 @@ namespace Zeze.Arch
     {
         private static readonly ILogger logger = LogManager.GetLogger(typeof(LinkdProvider));
         public LinkdApp LinkdApp { get; set; }
-        public ProviderDistribute Distribute { get; set; }
+        public ProviderDistributeVersion Distribute { get; set; }
 
         // 用于客户端选择Provider，只支持一种Provider。如果要支持多种，需要客户端增加参数，这个不考虑了。
         // 内部的ModuleRedirect ModuleRedirectAll Transmit都携带了ServiceNamePrefix参数，所以，
@@ -46,11 +46,10 @@ namespace Zeze.Arch
                     var providerModuleState = new ProviderModuleState(providerSession.SessionId,
                         module.Key, module.Value.ChoiceType, module.Value.ConfigType);
                     var serviceName = ProviderDistribute.MakeServiceName(providerSession.Info.ServiceNamePrefix, module.Key);
-                    var subState = await LinkdApp.Zeze.ServiceManager.SubscribeService(serviceName,
-                        SubscribeInfo.SubscribeTypeSimple, providerModuleState);
+                    var subState = await LinkdApp.Zeze.ServiceManager.SubscribeService(serviceName, providerModuleState);
                     // 订阅成功以后，仅仅需要设置ready。service-list由Agent维护。
                     // 即使 SubscribeTypeSimple 也需要设置 Ready，因为 providerModuleState 需要设置到ServiceInfo中，以后Choice的时候需要用。
-                    subState.SetServiceIdentityReadyState(providerSession.Info.ServiceIndentity, providerModuleState);
+                    subState.SetIdentityLocalState(providerSession.Info.ServiceIndentity, providerModuleState);
                     providerSession.StaticBinds.TryAdd(module.Key, module.Key);
                 }
             }
@@ -137,11 +136,10 @@ namespace Zeze.Arch
                 var providerModuleState = new ProviderModuleState(ps.SessionId,
                         module.Key, module.Value.ChoiceType, module.Value.ConfigType);
                 var serviceName = ProviderDistribute.MakeServiceName(ps.Info.ServiceNamePrefix, module.Key);
-                var subState = await LinkdApp.Zeze.ServiceManager.SubscribeService(
-                        serviceName, module.Value.SubscribeType, providerModuleState);
+                var subState = await LinkdApp.Zeze.ServiceManager.SubscribeService(serviceName, providerModuleState);
                 // 订阅成功以后，仅仅需要设置ready。service-list由Agent维护。
                 // 即使 SubscribeTypeSimple 也需要设置 Ready，因为 providerModuleState 需要设置到ServiceInfo中，以后Choice的时候需要用。
-                subState.SetServiceIdentityReadyState(ps.Info.ServiceIndentity, providerModuleState);
+                subState.SetIdentityLocalState(ps.Info.ServiceIndentity, providerModuleState);
             }
 
             rpc.SendResult();
@@ -163,7 +161,7 @@ namespace Zeze.Arch
                 }
                 // UnBind 不删除provider-list，这个总是通过ServiceManager通告更新。
                 // 这里仅仅设置该moduleId对应的服务的状态不可用。
-                volatileProviders.SetServiceIdentityReadyState(ps.Info.ServiceIndentity, null);
+                volatileProviders.SetIdentityLocalState(ps.Info.ServiceIndentity, null);
             }
         }
         protected override Task<long> ProcessUnBindRequest(Zeze.Net.Protocol p)
@@ -217,16 +215,20 @@ namespace Zeze.Arch
             // 如果需要某个provider.SessionId，需要查询 ServiceInfoListSortedByIdentity 里的ServiceInfo.LocalState。
             var providerModuleState = providers.SubscribeInfo.LocalState as ProviderModuleState;
 
+            var distribute = LinkdApp.LinkdProvider.Distribute.SelectDistribute(0); // TODO version from client
+            if (null == distribute)
+                return false;
+
             switch (providerModuleState.ChoiceType)
             {
                 case BModule.ChoiceTypeHashAccount:
-                    return LinkdApp.LinkdProvider.Distribute.ChoiceHash(providers, FixedHash.Hash32(linkSession.Account), out provider);
+                    return distribute.ChoiceHash(providers, FixedHash.Hash32(linkSession.Account), out provider);
 
                 case BModule.ChoiceTypeHashRoleId:
                     var roleId = linkSession.RoleId;
                     if (null != roleId)
                     {
-                        return LinkdApp.LinkdProvider.Distribute.ChoiceHash(providers, FixedHash.calc_hashnr(roleId.Value), out provider);
+                        return distribute.ChoiceHash(providers, FixedHash.calc_hashnr(roleId.Value), out provider);
                     }
                     else
                     {
@@ -234,11 +236,11 @@ namespace Zeze.Arch
                     }
 
                 case BModule.ChoiceTypeFeedFullOneByOne:
-                    return LinkdApp.LinkdProvider.Distribute.ChoiceFeedFullOneByOne(providers, out provider);
+                    return distribute.ChoiceFeedFullOneByOne(providers, out provider);
             }
 
             // default
-            if (LinkdApp.LinkdProvider.Distribute.ChoiceLoad(providers, out provider))
+            if (distribute.ChoiceLoad(providers, out provider))
             {
                 // 这里不判断null，如果失败让这次选择失败，否则选中了，又没有Bind以后更不好处理。
                 var providerSocket = LinkdApp.LinkdProviderService.GetSocket(provider);

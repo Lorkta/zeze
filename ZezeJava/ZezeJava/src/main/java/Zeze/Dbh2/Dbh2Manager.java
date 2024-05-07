@@ -1,6 +1,7 @@
 package Zeze.Dbh2;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -18,6 +19,7 @@ import Zeze.Util.KV;
 import Zeze.Util.PerfCounter;
 import Zeze.Util.ShutdownHook;
 import Zeze.Util.Task;
+import Zeze.Util.TaskOneByOneByKey;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -46,8 +48,18 @@ public class Dbh2Manager {
 
 	private final ConcurrentHashMap<String, Dbh2> dbh2s = new ConcurrentHashMap<>();
 
+	private final TaskOneByOneByKey taskOneByOne = new TaskOneByOneByKey();
+
 	public MasterAgent getMasterAgent() {
 		return masterAgent;
+	}
+
+	public Dbh2Config getDbh2Config() {
+		return dbh2Config;
+	}
+
+	public TaskOneByOneByKey getTaskOneByOne() {
+		return taskOneByOne;
 	}
 
 	void register(String acceptor, int port, int bucketCount) {
@@ -75,7 +87,8 @@ public class Dbh2Manager {
 				r.Argument.getRaftConfig(),
 				StandardOpenOption.CREATE);
 		dbh2s.computeIfAbsent(r.Argument.getRaftConfig(), __ -> {
-			var dbh2 = new Dbh2(this, raftConfig.getName(), raftConfig, null, false);
+			var dbh2 = new Dbh2(this, raftConfig.getName(), raftConfig,
+					null, false, taskOneByOne);
 			proxyServer.addRaft(dbh2.getRaft());
 			logger.info("CreateBucket: add raftName = '{}'", dbh2.getRaft().getName());
 			return dbh2;
@@ -137,18 +150,23 @@ public class Dbh2Manager {
 		var raftXmlFiles = new ArrayList<File>();
 		listRaftXmlFiles(new File(home), raftXmlFiles);
 		logger.info("loading {} raftXmlFiles from '{}'", raftXmlFiles.size(), home);
-		for (var raftXml : raftXmlFiles) {
-			var bytes = java.nio.file.Files.readAllBytes(raftXml.toPath());
-			var raftStr = new String(bytes, StandardCharsets.UTF_8);
-			var raftConfig = RaftConfig.loadFromString(raftStr);
-			raftConfig.setDbHome(raftXml.getParent());
-			dbh2s.computeIfAbsent(raftStr, __ -> {
-				var dbh2 = new Dbh2(this, raftConfig.getName(), raftConfig, null, false);
-				proxyServer.addRaft(dbh2.getRaft());
-				logger.info("start: add raftName = '{}'", dbh2.getRaft().getName());
-				return dbh2;
-			});
-		}
+		raftXmlFiles.parallelStream().forEach((raftXml) -> {
+			try {
+				var bytes = java.nio.file.Files.readAllBytes(raftXml.toPath());
+				var raftStr = new String(bytes, StandardCharsets.UTF_8);
+				var raftConfig = RaftConfig.loadFromString(raftStr);
+				raftConfig.setDbHome(raftXml.getParent());
+				dbh2s.computeIfAbsent(raftStr, __ -> {
+					var dbh2 = new Dbh2(this, raftConfig.getName(), raftConfig,
+							null, false, taskOneByOne);
+					proxyServer.addRaft(dbh2.getRaft());
+					logger.info("start: add raftName = '{}'", dbh2.getRaft().getName());
+					return dbh2;
+				});
+			} catch (IOException ex) {
+				throw new RuntimeException(ex);
+			}
+		});
 		masterAgent.startAndWaitConnectionReady();
 		proxyServer.start();
 

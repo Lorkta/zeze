@@ -17,6 +17,16 @@ public final class tAccountTimers extends TableX<String, Zeze.Builtin.Timer.BArc
     }
 
     @Override
+    public Class<String> getKeyClass() {
+        return String.class;
+    }
+
+    @Override
+    public Class<Zeze.Builtin.Timer.BArchOnlineTimer> getValueClass() {
+        return Zeze.Builtin.Timer.BArchOnlineTimer.class;
+    }
+
+    @Override
     public boolean isMemory() {
         return true;
     }

@@ -2,6 +2,7 @@ package Zeze.Netty;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.security.PrivateKey;
 import java.security.cert.X509Certificate;
@@ -14,8 +15,12 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import javax.net.ssl.SSLException;
 import Zeze.Application;
+import Zeze.Net.Helper;
+import Zeze.Services.ServiceManager.AbstractAgent;
+import Zeze.Services.ServiceManager.BServiceInfo;
 import Zeze.Transaction.DispatchMode;
 import Zeze.Transaction.TransactionLevel;
 import Zeze.Util.ConcurrentHashSet;
@@ -78,7 +83,9 @@ public class HttpServer extends ChannelInitializer<SocketChannel> implements Clo
 	protected int writeIdleTimeout = 60; // 服务端无发送的超时时间(秒)
 	protected @Nullable SslContext sslCtx;
 	protected @Nullable Future<?> scheduler;
-	protected @Nullable ChannelFuture channelFuture;
+	protected ChannelFuture channelFuture;
+	protected final ReentrantLock thisLock = new ReentrantLock();
+	protected @Nullable HttpSession httpSession;
 
 	public static @NotNull String getDate() {
 		var second = GlobalTimer.getCurrentMillis() / 1000;
@@ -123,6 +130,25 @@ public class HttpServer extends ChannelInitializer<SocketChannel> implements Clo
 		this.fileCacheSeconds = fileCacheSeconds;
 	}
 
+	public void lock() {
+		thisLock.lock();
+	}
+
+	public void unlock() {
+		thisLock.unlock();
+	}
+
+	// before start
+	public void enableHttpSession() {
+		if (zeze == null)
+			throw new IllegalStateException("zeze is null.");
+		httpSession = new HttpSession(zeze);
+	}
+
+	public @Nullable HttpSession getHttpSession() {
+		return httpSession;
+	}
+
 	public int getWritePendingLimit() {
 		return writePendingLimit;
 	}
@@ -160,34 +186,116 @@ public class HttpServer extends ChannelInitializer<SocketChannel> implements Clo
 		sslCtx = SslContextBuilder.forServer(priKey, keyPassword, keyCertChain).build();
 	}
 
-	public @NotNull ChannelFuture start(@NotNull Netty netty, int port) {
+	public @NotNull ChannelFuture start(@NotNull Netty netty, int port) throws Exception {
 		return start(netty, null, port);
 	}
 
-	public synchronized @NotNull ChannelFuture start(@NotNull Netty netty, @Nullable String host, int port) {
-		if (scheduler != null)
-			throw new IllegalStateException("already started");
-		scheduler = netty.getEventLoopGroup().scheduleWithFixedDelay(
-				() -> channels.keySet().forEach(this::checkTimeout),
-				checkIdleInterval, checkIdleInterval, TimeUnit.SECONDS);
-		return channelFuture = netty.startServer(this, host, port);
+	public @NotNull ChannelFuture start(@NotNull Netty netty, @Nullable String host, int port) throws Exception {
+		lock();
+		if (httpSession != null)
+			httpSession.start();
+
+		try {
+			if (scheduler != null)
+				throw new IllegalStateException("already started");
+			scheduler = netty.getEventLoopGroup().scheduleWithFixedDelay(
+					() -> channels.keySet().forEach(this::checkTimeout),
+					checkIdleInterval, checkIdleInterval, TimeUnit.SECONDS);
+			return channelFuture = netty.startServer(this, host, port);
+		} finally {
+			unlock();
+		}
+	}
+
+	public ChannelFuture getChannelFuture() {
+		return channelFuture;
+	}
+
+	/**
+	 * 需要端口已在监听状态才能获取到, 可能会同步等待监听的启动
+	 *
+	 * @return 无法获取时返回null
+	 */
+	public @Nullable InetSocketAddress getLocalAddress() {
+		var cf = channelFuture;
+		if (cf == null)
+			return null;
+		try {
+			cf.sync();
+		} catch (InterruptedException e) {
+			return null;
+		}
+		var addr = cf.channel().localAddress();
+		return addr instanceof InetSocketAddress ? (InetSocketAddress)addr : null;
+	}
+
+	/**
+	 * 获取实际监听的IP地址, 其他机器可以通过这个连接过来. 可能会同步等待监听的启动
+	 *
+	 * @throws IllegalStateException 无法获取时会抛出
+	 */
+	public @NotNull String getExportIp() {
+		var addr = getLocalAddress();
+		if (addr == null)
+			throw new IllegalStateException();
+		return addr.getAddress().isAnyLocalAddress()
+				? Helper.selectOneIpAddress(false)
+				: addr.getAddress().getHostAddress();
+	}
+
+	/**
+	 * 获取实际监听的端口. 可能会同步等待监听的启动
+	 *
+	 * @throws IllegalStateException 无法获取时会抛出
+	 */
+	public int getPort() {
+		var addr = getLocalAddress();
+		if (addr == null)
+			throw new IllegalStateException();
+		return addr.getPort();
+	}
+
+	public void publishService(String serviceName) throws InterruptedException {
+		if (null == zeze)
+			throw new IllegalStateException("without zeze env. use another publishService method with your special agent");
+		publishService(serviceName, 0, zeze.getServiceManager());
+	}
+
+	/**
+	 * 发布HttpServer到指定agent。
+	 *
+	 * @param serviceName 服务名
+	 * @param version     服务版本
+	 */
+	public void publishService(@NotNull String serviceName, long version, @NotNull AbstractAgent agent)
+			throws InterruptedException {
+		var ip = getExportIp();
+		int port = getPort();
+		agent.registerService(new BServiceInfo(serviceName, "@" + ip + ":" + port, version, ip, port));
 	}
 
 	@Override
-	public synchronized void close() {
-		task11Executor.shutdown(true);
-		if (scheduler == null)
-			return;
-		Netty.logger.info("close {}", getClass().getName());
-		scheduler.cancel(true);
-		scheduler = null;
-		exchanges.values().forEach(HttpExchange::closeConnectionNow);
-		exchanges.clear();
-		if (channelFuture != null) {
-			var ch = channelFuture.channel();
-			channelFuture = null;
-			if (ch != null)
-				ch.close();
+	public void close() {
+		lock();
+		try {
+			task11Executor.shutdown(true);
+			if (scheduler == null)
+				return;
+			Netty.logger.info("close {}", getClass().getName());
+			scheduler.cancel(true);
+			scheduler = null;
+			exchanges.values().forEach(HttpExchange::closeConnectionNow);
+			exchanges.clear();
+			if (channelFuture != null) {
+				var ch = channelFuture.channel();
+				channelFuture = null;
+				if (ch != null)
+					ch.close();
+			}
+			if (httpSession != null)
+				httpSession.stop();
+		} finally {
+			unlock();
 		}
 	}
 

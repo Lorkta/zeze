@@ -12,6 +12,8 @@ namespace Zeze.Gen.java
             var hasParentName = new bool[1];
             foreach (Variable v in bean.Variables)
             {
+                if (v.Transient)
+                    continue;
                 v.VariableType.Accept(new DecodeResultSet(v, v.Id, "rs", sw, $"{prefix}    ", hasParentName, false));
             }
             sw.WriteLine(prefix + "}");
@@ -25,6 +27,8 @@ namespace Zeze.Gen.java
             var hasParentName = new bool[1];
             foreach (Variable v in bean.Variables)
             {
+                if (v.Transient)
+                    continue;
                 v.VariableType.Accept(new DecodeResultSet(v, v.Id, "rs", sw, $"{prefix}    ", hasParentName, true));
             }
             sw.WriteLine(prefix + "}");
@@ -222,6 +226,18 @@ namespace Zeze.Gen.java
             sw.WriteLine($"{prefix}parents.add(\"{ColumnName}\");");
             sw.WriteLine($"{prefix}{AssignText($"Zeze.Serialize.Helper.decodeVector4(parents, {bb})")};");
             sw.WriteLine($"{prefix}parents.remove(parents.size() - 1);");
+        }
+
+        public void Visit(TypeDecimal type)
+        {
+            ensureParentsName();
+            sw.WriteLine($"{prefix}{{");
+            sw.WriteLine($"{prefix}    var tmp = {bb}.getString({ParaneName}\"{ColumnName}\");");
+            sw.WriteLine($"{prefix}    if (tmp == null)");
+            sw.WriteLine($"{prefix}        {AssignText("java.math.BigDecimal.ZERO")};");
+            sw.WriteLine($"{prefix}    else");
+            sw.WriteLine($"{prefix}        {AssignText($"new java.math.BigDecimal(tmp, java.math.MathContext.DECIMAL128)")};");
+            sw.WriteLine($"{prefix}}}");
         }
     }
 }

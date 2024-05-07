@@ -1,6 +1,8 @@
 package Zeze.Dbh2;
 
 import java.net.URI;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import Zeze.Application;
 import Zeze.Builtin.Dbh2.BPrepareBatch;
 import Zeze.Builtin.Dbh2.Commit.BPrepareBatches;
@@ -20,6 +22,7 @@ import Zeze.Transaction.TableWalkHandleRaw;
 import Zeze.Transaction.TableWalkKeyRaw;
 import Zeze.Util.KV;
 import Zeze.Util.TaskCompletionSource;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import Zeze.Builtin.Dbh2.Master.BSetInUse;
 
@@ -57,7 +60,6 @@ public class Database extends Zeze.Transaction.Database {
 	}
 
 	private final class OperatesDbh2 implements Operates {
-
 		@Override
 		public void setInUse(int localId, String global) {
 			var r = new SetInUse();
@@ -106,14 +108,13 @@ public class Database extends Zeze.Transaction.Database {
 			r.SendForWait(masterAgent.getService().GetSocket()).await();
 			var error = IModule.getErrorCode(r.getResultCode());
 			switch (error) {
-				case BSaveDataWithSameVersion.eSuccess:
-					return KV.create(r.Result.getVersion(), true);
-				case BSaveDataWithSameVersion.eVersionMismatch:
-					return KV.create(0L, false);
-				default:
-					throw new RuntimeException("SaveDataWithSameVersion error=" + error);
+			case BSaveDataWithSameVersion.eSuccess:
+				return KV.create(r.Result.getVersion(), true);
+			case BSaveDataWithSameVersion.eVersionMismatch:
+				return KV.create(0L, false);
+			default:
+				throw new RuntimeException("SaveDataWithSameVersion error=" + error);
 			}
-
 		}
 
 		@Override
@@ -149,16 +150,149 @@ public class Database extends Zeze.Transaction.Database {
 		}
 	}
 
+	private final ConcurrentHashMap<String, Dbh2Table> tables = new ConcurrentHashMap<>();
+
 	@Override
-	public Table openTable(String name) {
+	public Table openTable(String name, int id) {
 		if (name.contains("@"))
 			throw new RuntimeException("'@' is reserve.");
+
+		var special = "___"; // prefix table 使用这个最后
+		var idx = name.indexOf(special);
+		if (idx >= 0) {
+			var tableName = name.substring(idx + special.length());
+			return new Dbh2PrefixTable(tables.computeIfAbsent(tableName, Dbh2Table::new), id);
+		}
+		// 这里不使用tables，保留的旧的逻辑不变。
 		return new Dbh2Table(name);
 	}
 
 	@Override
 	public Transaction beginTransaction() {
 		return new Dbh2Transaction();
+	}
+
+	private static ByteBuffer removePrefix(@Nullable ByteBuffer key) {
+		if (null == key)
+			return null;
+		key.ReadIndex += Dbh2PrefixTable.TABLE_PREFIX;
+		return key;
+	}
+
+	public class Dbh2PrefixTable extends AbstractKVTable {
+		private static final int TABLE_PREFIX = 4; // sizeof(int)
+
+		private final Dbh2Table table;
+		private final byte[] prefix = new byte[TABLE_PREFIX];
+
+		public Dbh2PrefixTable(Dbh2Table table, int id) {
+			this.table = table;
+			table.addRef();
+			ByteBuffer.intLeHandler.set(this.prefix, 0, id);
+		}
+
+		@Override
+		public int keyOffsetInRawKey() {
+			return TABLE_PREFIX;
+		}
+
+		@Override
+		public boolean isNew() {
+			return false;
+		}
+
+		@Override
+		public Zeze.Transaction.@NotNull Database getDatabase() {
+			return Database.this;
+		}
+
+		@Override
+		public void close() {
+			table.decRef();
+		}
+
+		private ByteBuffer addPrefix(@Nullable ByteBuffer key) {
+			if (null == key)
+				return ByteBuffer.Wrap(prefix);
+			var prefixKey = ByteBuffer.Allocate(TABLE_PREFIX + key.size());
+			prefixKey.Append(prefix);
+			prefixKey.Append(key.Bytes, key.ReadIndex, key.size());
+			return prefixKey;
+		}
+
+		@Override
+		public @Nullable ByteBuffer find(@NotNull ByteBuffer key) {
+			return table.find(addPrefix(key));
+		}
+
+		@Override
+		public void replace(@NotNull Transaction t, @NotNull ByteBuffer key, @NotNull ByteBuffer value) {
+			var txn = (Dbh2Transaction)t;
+			txn.replace(table.getName(), addPrefix(key), value);
+		}
+
+		@Override
+		public void remove(@NotNull Transaction t, @NotNull ByteBuffer key) {
+			var txn = (Dbh2Transaction)t;
+			txn.remove(table.getName(), addPrefix(key));
+		}
+
+		@Override
+		public long walk(@NotNull TableWalkHandleRaw callback) {
+			return dbh2AgentManager.walk(masterAgent, masterName, databaseName,
+					table.getName(), callback, false, prefix);
+		}
+
+		@Override
+		public long walkKey(@NotNull TableWalkKeyRaw callback) {
+			return dbh2AgentManager.walkKey(masterAgent, masterName, databaseName,
+					table.getName(), callback, false, prefix);
+		}
+
+		@Override
+		public long walkDesc(@NotNull TableWalkHandleRaw callback) {
+			return dbh2AgentManager.walk(masterAgent, masterName, databaseName,
+					table.getName(), callback, true, prefix);
+		}
+
+		@Override
+		public long walkKeyDesc(@NotNull TableWalkKeyRaw callback) {
+			return dbh2AgentManager.walkKey(masterAgent, masterName, databaseName,
+					table.getName(), callback, true, prefix);
+		}
+
+		// 【注意】
+		// 由于prefix使用了exclusiveStartKey的api实现，
+		// 所以如果Dbh2PrefixTable的key是空的，那么遍历的时候，这条记录会被忽略。
+		// 目前zeze不会使用空的key，所以没问题。
+
+		@Override
+		public @Nullable ByteBuffer walk(@Nullable ByteBuffer exclusiveStartKey,
+										 int proposeLimit, @NotNull TableWalkHandleRaw callback) {
+			return removePrefix(dbh2AgentManager.walk(masterAgent, masterName, databaseName, table.getName(),
+					addPrefix(exclusiveStartKey), proposeLimit, callback, false, prefix));
+		}
+
+		@Override
+		public @Nullable ByteBuffer walkKey(@Nullable ByteBuffer exclusiveStartKey,
+											int proposeLimit, @NotNull TableWalkKeyRaw callback) {
+			return removePrefix(dbh2AgentManager.walkKey(masterAgent, masterName, databaseName, table.getName(),
+					addPrefix(exclusiveStartKey), proposeLimit, callback, false, prefix));
+		}
+
+		@Override
+		public @Nullable ByteBuffer walkDesc(@Nullable ByteBuffer exclusiveStartKey,
+											 int proposeLimit, @NotNull TableWalkHandleRaw callback) {
+			return removePrefix(dbh2AgentManager.walk(masterAgent, masterName, databaseName, table.getName(),
+					addPrefix(exclusiveStartKey), proposeLimit, callback, true, prefix));
+		}
+
+		@Override
+		public @Nullable ByteBuffer walkKeyDesc(@Nullable ByteBuffer exclusiveStartKey,
+												int proposeLimit, @NotNull TableWalkKeyRaw callback) {
+			return removePrefix(dbh2AgentManager.walkKey(masterAgent, masterName, databaseName, table.getName(),
+					addPrefix(exclusiveStartKey), proposeLimit, callback, true, prefix));
+		}
 	}
 
 	public class Dbh2Transaction implements Zeze.Transaction.Database.Transaction {
@@ -205,6 +339,17 @@ public class Database extends Zeze.Transaction.Database {
 		private final String name;
 		private boolean isNew;
 		private final TaskCompletionSource<Integer> ready = new TaskCompletionSource<>();
+		private final AtomicInteger ref = new AtomicInteger();
+
+		public void addRef() {
+			ref.incrementAndGet();
+		}
+
+		public void decRef() {
+			if (ref.decrementAndGet() == 0) {
+				close();
+			}
+		}
 
 		public Dbh2Table(String tableName) {
 			this.name = tableName;
@@ -283,56 +428,55 @@ public class Database extends Zeze.Transaction.Database {
 
 		@Override
 		public long walk(TableWalkHandleRaw callback) {
-			return dbh2AgentManager.walk(masterAgent, masterName, databaseName, name, callback, false);
+			return dbh2AgentManager.walk(masterAgent, masterName, databaseName, name, callback, false, null);
 		}
 
 		@Override
 		public long walkKey(TableWalkKeyRaw callback) {
-			return dbh2AgentManager.walkKey(masterAgent, masterName, databaseName, name, callback, false);
+			return dbh2AgentManager.walkKey(masterAgent, masterName, databaseName, name, callback, false, null);
 		}
 
 		@Override
 		public long walkDesc(TableWalkHandleRaw callback) {
-			return dbh2AgentManager.walk(masterAgent, masterName, databaseName, name, callback, true);
+			return dbh2AgentManager.walk(masterAgent, masterName, databaseName, name, callback, true, null);
 		}
 
 		@Override
 		public long walkKeyDesc(TableWalkKeyRaw callback) {
-			return dbh2AgentManager.walkKey(masterAgent, masterName, databaseName, name, callback, true);
+			return dbh2AgentManager.walkKey(masterAgent, masterName, databaseName, name, callback, true, null);
 		}
 
 		@Override
 		public ByteBuffer walk(ByteBuffer exclusiveStartKey, int proposeLimit, TableWalkHandleRaw callback) {
 			return dbh2AgentManager.walk(masterAgent, masterName, databaseName, name,
-					exclusiveStartKey, proposeLimit, callback, false);
+					exclusiveStartKey, proposeLimit, callback, false, null);
 		}
 
 		@Override
 		public ByteBuffer walkKey(ByteBuffer exclusiveStartKey, int proposeLimit, TableWalkKeyRaw callback) {
 			return dbh2AgentManager.walkKey(masterAgent, masterName, databaseName, name,
-					exclusiveStartKey, proposeLimit, callback, false);
+					exclusiveStartKey, proposeLimit, callback, false, null);
 		}
 
 		@Override
 		public ByteBuffer walkDesc(ByteBuffer exclusiveStartKey, int proposeLimit, TableWalkHandleRaw callback) {
 			return dbh2AgentManager.walk(masterAgent, masterName, databaseName, name,
-					exclusiveStartKey, proposeLimit, callback, true);
+					exclusiveStartKey, proposeLimit, callback, true, null);
 		}
 
 		@Override
 		public ByteBuffer walkKeyDesc(ByteBuffer exclusiveStartKey, int proposeLimit, TableWalkKeyRaw callback) {
 			return dbh2AgentManager.walkKey(masterAgent, masterName, databaseName, name,
-					exclusiveStartKey, proposeLimit, callback, true);
+					exclusiveStartKey, proposeLimit, callback, true, null);
 		}
 
 		@Override
 		public void close() {
-
+			tables.remove(name);
 		}
 	}
 
 	public static class Dbh2Operates implements Zeze.Transaction.Database.Operates {
-
 		@Override
 		public void setInUse(int localId, String global) {
 		}
@@ -352,5 +496,4 @@ public class Database extends Zeze.Transaction.Database {
 			return null;
 		}
 	}
-
 }

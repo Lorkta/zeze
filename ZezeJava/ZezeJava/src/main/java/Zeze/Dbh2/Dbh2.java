@@ -29,9 +29,11 @@ import Zeze.Transaction.DispatchMode;
 import Zeze.Transaction.Procedure;
 import Zeze.Util.Action0;
 import Zeze.Util.Action2;
+import Zeze.Util.FastLock;
 import Zeze.Util.FuncLong;
 import Zeze.Util.RocksDatabase;
 import Zeze.Util.Task;
+import Zeze.Util.TaskOneByOneByKey;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
@@ -64,25 +66,37 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 	public class Dbh2RaftServer extends Zeze.Raft.Server {
 		public Dbh2RaftServer(Raft raft, String name, Config config) {
 			super(raft, name, config);
+			setInstanceName(raft.getName());
 		}
 
+		private final FastLock prepareQueueLock = new FastLock();
 		private ConcurrentLinkedQueue<Action0> prepareQueue;
 
-		public synchronized void setupPrepareQueue() {
-			if (null == prepareQueue)
-				prepareQueue = new ConcurrentLinkedQueue<>();
+		public void setupPrepareQueue() {
+			prepareQueueLock.lock();
+			try {
+				if (null == prepareQueue)
+					prepareQueue = new ConcurrentLinkedQueue<>();
+			} finally {
+				prepareQueueLock.unlock();
+			}
 		}
 
-		public synchronized ConcurrentLinkedQueue<Action0> takePrepareQueue() {
-			var tmp = prepareQueue;
-			prepareQueue = null;
-			return tmp;
+		public ConcurrentLinkedQueue<Action0> takePrepareQueue() {
+			prepareQueueLock.lock();
+			try {
+				var tmp = prepareQueue;
+				prepareQueue = null;
+				return tmp;
+			} finally {
+				prepareQueueLock.unlock();
+			}
 		}
 
 		@Override
 		public <P extends Protocol<?>> void dispatchRaftRpcResponse(P p, ProtocolHandle<P> responseHandle,
 																	ProtocolFactoryHandle<?> factoryHandle) throws Exception {
-			raft.getImportantThreadExecutor().execute(() -> {
+			Raft.executeImportantTask(() -> {
 				try {
 					responseHandle.handle(p);
 				} catch (Exception e) {
@@ -92,15 +106,23 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 		}
 
 		@Override
-		public synchronized void dispatchRaftRequest(Protocol<?> p, FuncLong func, String name, Action0 cancel,
-													 DispatchMode mode) throws Exception {
-			if (null != prepareQueue && isPrepareRequest(p.getTypeId())) {
-				prepareQueue.add(() -> Task.call(func, p));
-			} else if (isQueryRequest(p.getTypeId())) {
+		public void dispatchRaftRequest(Protocol<?> p, FuncLong func, String name, Action0 cancel,
+										DispatchMode mode) throws Exception {
+			prepareQueueLock.lock();
+			try {
+				if (null != prepareQueue && isPrepareRequest(p.getTypeId())) {
+					prepareQueue.add(() -> Task.call(func, p));
+					return;
+				}
+			} finally {
+				prepareQueueLock.unlock();
+			}
+
+			if (isQueryRequest(p.getTypeId())) {
 				// 允许Get请求并发
 				super.dispatchRaftRequest(p, func, name, cancel, mode);
 			} else {
-				raft.getUserThreadExecutor().execute(() -> Task.call(func, p));
+				raft.executeUserTask(() -> Task.call(func, p));
 			}
 		}
 	}
@@ -131,7 +153,8 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 		return dbh2Config;
 	}
 
-	public Dbh2(Dbh2Manager manager, String raftName, RaftConfig raftConf, Config config, boolean writeOptionSync) {
+	public Dbh2(Dbh2Manager manager, String raftName, RaftConfig raftConf, Config config, boolean writeOptionSync,
+				TaskOneByOneByKey taskOneByOne) {
 		this.manager = manager;
 
 		var selfNode = raftConf.getNodes().get(raftName);
@@ -146,7 +169,8 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 
 		try {
 			stateMachine = new Dbh2StateMachine(this);
-			raft = new Raft(stateMachine, raftName, raftConf, config, "Zeze.Dbh2.Server", Dbh2RaftServer::new);
+			raft = new Raft(stateMachine, raftName, raftConf, config,
+					"Zeze.Dbh2.Server", Dbh2RaftServer::new, taskOneByOne);
 			raftConf.setSnapshotCommitDelayed(true);
 			logger.info("newRaft: {}", raft.getName());
 			stateMachine.openBucket();
@@ -165,7 +189,7 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 
 	@Override
 	public void close() throws IOException {
-		logger.info("closeRaft: " + raft.getName());
+		logger.info("closeRaft: {}", raft.getName());
 		try {
 			raft.shutdown();
 			stateMachine.close();
@@ -188,18 +212,18 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 //		var lock = getLocks().get(r.Argument.getKey());
 //		lock.lock(this);
 //		try {
-			// 直接读取数据库。是否可以读取由raft控制。raft启动时有准备阶段。
-			var bucket = stateMachine.getBucket();
-			if (!bucket.inBucket(r.Argument.getDatabase(), r.Argument.getTable(), r.Argument.getKey()))
-				return errorCode(eBucketMismatch);
-			var value = bucket.get(r.Argument.getKey());
-			if (null == value)
-				r.Result.setNull(true);
-			else {
-				r.Result.setValue(value);
-				stateMachine.sizeGet.addAndGet(value.size());
-			}
-			r.SendResult();
+		// 直接读取数据库。是否可以读取由raft控制。raft启动时有准备阶段。
+		var bucket = stateMachine.getBucket();
+		if (!bucket.inBucket(r.Argument.getDatabase(), r.Argument.getTable(), r.Argument.getKey()))
+			return errorCode(eBucketMismatch);
+		var value = bucket.get(r.Argument.getKey());
+		if (null == value)
+			r.Result.setNull(true);
+		else {
+			r.Result.setValue(value);
+			stateMachine.sizeGet.addAndGet(value.size());
+		}
+		r.SendResult();
 //		} finally {
 //			lock.unlock();
 //		}
@@ -288,7 +312,7 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 		return 0;
 	}
 
-	private boolean walkDesc(Binary exclusiveStartKey, int proposeLimit,
+	private boolean walkDesc(Binary exclusiveStartKey, int proposeLimit, Binary prefix,
 							 Action2<Binary, RocksIterator> fill) throws Exception {
 		try (var it = stateMachine.getBucket().getData().iterator()) {
 			if (exclusiveStartKey.size() > 0) {
@@ -309,19 +333,24 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 			}
 
 			var count = proposeLimit;
+			var bucketEnd = false;
 			for (; it.isValid() && count > 0; it.prev(), count--) {
 				var key = new Binary(it.key());
+				if (prefix.size() > 0 && !key.startsWith(prefix)) {
+					bucketEnd = true;
+					break;
+				}
 				fill.run(key, it);
 			}
 
-			return !it.isValid();
+			return bucketEnd || !it.isValid();
 		}
 	}
 
-	private boolean walk(Binary exclusiveStartKey, int proposeLimit, boolean desc,
+	private boolean walk(Binary exclusiveStartKey, int proposeLimit, boolean desc, Binary prefix,
 						 Action2<Binary, RocksIterator> fill) throws Exception {
 		if (desc) {
-			return walkDesc(exclusiveStartKey, proposeLimit, fill);
+			return walkDesc(exclusiveStartKey, proposeLimit, prefix, fill);
 		}
 
 		try (var it = stateMachine.getBucket().getData().iterator()) {
@@ -347,6 +376,11 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 					bucketEnd = true;
 					break;
 				}
+				// 如果使用了prefix，那么发现了新的prefix时，也表示搜索结束。
+				if (prefix.size() >= 0 && !key.startsWith(prefix)) {
+					bucketEnd = true;
+					break;
+				}
 				fill.run(key, it);
 			}
 
@@ -365,6 +399,7 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 				r.Argument.getExclusiveStartKey(),
 				r.Argument.getProposeLimit(),
 				r.Argument.isDesc(),
+				r.Argument.getPrefix(),
 				(key, it) -> r.Result.getKeyValues().add(new BWalkKeyValue.Data(key, new Binary(it.value()))));
 		r.Result.setBucketEnd(bucketEnd);
 		r.SendResult();
@@ -383,6 +418,7 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 				r.Argument.getExclusiveStartKey(),
 				r.Argument.getProposeLimit(),
 				r.Argument.isDesc(),
+				r.Argument.getPrefix(),
 				(key, it) -> r.Result.getKeys().add(key));
 		r.Result.setBucketEnd(bucketEnd);
 		r.SendResult();
@@ -398,7 +434,7 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 		@Override
 		public <P extends Protocol<?>> void dispatchRpcResponse(P rpc, ProtocolHandle<P> responseHandle,
 																ProtocolFactoryHandle<?> factoryHandle) {
-			raft.getUserThreadExecutor().execute(() -> {
+			raft.executeUserTask(() -> {
 				try {
 					responseHandle.handle(rpc);
 				} catch (Throwable e) { // run handle. 必须捕捉所有异常。logger.error
@@ -413,7 +449,7 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 			if (p.getTypeId() == Zeze.Raft.LeaderIs.TypeId_) {
 				Task.getCriticalThreadPool().execute(() -> Task.call(() -> p.handle(this, factoryHandle), "InternalRequest"));
 			} else {
-				raft.getUserThreadExecutor().execute(() -> Task.executeUnsafe(
+				raft.executeUserTask(() -> Task.executeUnsafe(
 						() -> p.handle(this, factoryHandle),
 						p,
 						null,
@@ -527,74 +563,79 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 	}
 
 	// 开始分桶流程有两个线程需要访问：timer & raft.UserThreadExecutor
-	private synchronized void startSplit(boolean isMove) throws Exception {
-		if (!getRaft().isLeader())
-			return;
-
-		// 后面需要在lambda中传递系列号作为上下文，使用成员变量是不是会跟随变化？
-		var serialNo = manager.atomicSerialNo.incrementAndGet();
-		splitSerialNo = serialNo;
-		var bucket = stateMachine.getBucket();
-		RocksIterator it = null;
+	private void startSplit(boolean isMove) throws Exception {
+		lock();
 		try {
-			var splitting = bucket.getSplittingMeta(); // 对于timer，这个会调用两次。
-			if (null == splitting) {
-				// 第一次开始分桶，准备阶段。
-				// 这个阶段在timer回调中执行，可以同步调用一些网络接口。
-				// 先去manager查一下可用的manager是否够，简单判断，不原子化。
-				if (manager.getMasterAgent().checkFreeManager() < dbh2Config.getRaftClusterCount()) {
-					logger.warn("splitting not enough free manager. isMove={}", isMove);
-					return;
-				}
-				// 上一次分桶结束的deleteRange可能还没compact，此时keyNumbers不准确，这里总是执行一次。
-				bucket.getData().compact();
+			if (!getRaft().isLeader())
+				return;
 
-				it = isMove ? locateFirst() : locateMiddle();
+			// 后面需要在lambda中传递系列号作为上下文，使用成员变量是不是会跟随变化？
+			var serialNo = manager.atomicSerialNo.incrementAndGet();
+			splitSerialNo = serialNo;
+			var bucket = stateMachine.getBucket();
+			RocksIterator it = null;
+			try {
+				var splitting = bucket.getSplittingMeta(); // 对于timer，这个会调用两次。
+				if (null == splitting) {
+					// 第一次开始分桶，准备阶段。
+					// 这个阶段在timer回调中执行，可以同步调用一些网络接口。
+					// 先去manager查一下可用的manager是否够，简单判断，不原子化。
+					if (manager.getMasterAgent().checkFreeManager() < dbh2Config.getRaftClusterCount()) {
+						logger.warn("splitting not enough free manager. isMove={}", isMove);
+						return;
+					}
+					// 上一次分桶结束的deleteRange可能还没compact，此时keyNumbers不准确，这里总是执行一次。
+					bucket.getData().compact();
+
+					it = isMove ? locateFirst() : locateMiddle();
+					if (null == it) {
+						logger.info("splitting break start: it is null. isMove={}", isMove);
+						return; // empty？不需要执行后续操作。break progress.
+					}
+					var newMeta = stateMachine.getBucket().getBucketMeta().copy();
+					newMeta.setRaftConfig("");
+					if (!isMove)
+						newMeta.setKeyFirst(new Binary(it.key()));
+					splitting = manager.getMasterAgent().createSplitBucket(newMeta);
+
+					// 设置分桶进行中的标记到raft集群中。
+					getRaft().appendLog(new LogSetSplittingMeta(splitting));
+					// 创建到分桶目标的客户端。
+					logger.info("splitting start... isMove={} {}->{}",
+							isMove, formatMeta(bucket.getBucketMeta()), formatMeta(splitting));
+				}
+
+				// 重启的时候，需要重建到分桶的连接。
+				if (null == dbh2Splitting) {
+					dbh2Splitting = new Dbh2Agent(splitting.getRaftConfig(), RaftAgentNetClient::new);
+					dbh2Splitting.getRaftAgent().setPendingLimit(Integer.MAX_VALUE);
+				}
+
+				var server = (Dbh2RaftServer)getRaft().getServer();
+				performPrepareQueue(server.takePrepareQueue());
+
 				if (null == it) {
-					logger.info("splitting break start: it is null. isMove={}", isMove);
-					return; // empty？不需要执行后续操作。break progress.
+					// 重新开始分桶时走这个分支，根据上次找到的middle，定位it。
+					it = isMove ? locateFirst() : locateMiddle(splitting.getKeyFirst());
+					if (null == it) {
+						logger.info("splitting break restart: it is null. isMove={}", isMove);
+						return;
+					}
+					logger.info("splitting restart... isMove={} {}->{}",
+							isMove, formatMeta(bucket.getBucketMeta()), formatMeta(splitting));
 				}
-				var newMeta = stateMachine.getBucket().getBucketMeta().copy();
-				newMeta.setRaftConfig("");
-				if (!isMove)
-					newMeta.setKeyFirst(new Binary(it.key()));
-				splitting = manager.getMasterAgent().createSplitBucket(newMeta);
 
-				// 设置分桶进行中的标记到raft集群中。
-				getRaft().appendLog(new LogSetSplittingMeta(splitting));
-				// 创建到分桶目标的客户端。
-				logger.info("splitting start... isMove={} {}->{}",
-						isMove, formatMeta(bucket.getBucketMeta()), formatMeta(splitting));
+				// 开始同步数据，这个阶段对于rocks时同步访问的，对于网络是异步的。
+				var puts = buildSplitPut(it);
+				var fit = it;
+				dbh2Splitting.getRaftAgent().send(puts, (p) -> splitPutNext(isMove, (SplitPut)p, fit, serialNo));
+				it = null;
+			} finally {
+				if (null != it)
+					it.close();
 			}
-
-			// 重启的时候，需要重建到分桶的连接。
-			if (null == dbh2Splitting) {
-				dbh2Splitting = new Dbh2Agent(splitting.getRaftConfig(), RaftAgentNetClient::new);
-				dbh2Splitting.getRaftAgent().setPendingLimit(Integer.MAX_VALUE);
-			}
-
-			var server = (Dbh2RaftServer)getRaft().getServer();
-			performPrepareQueue(server.takePrepareQueue());
-
-			if (null == it) {
-				// 重新开始分桶时走这个分支，根据上次找到的middle，定位it。
-				it = isMove ? locateFirst() : locateMiddle(splitting.getKeyFirst());
-				if (null == it) {
-					logger.info("splitting break restart: it is null. isMove={}", isMove);
-					return;
-				}
-				logger.info("splitting restart... isMove={} {}->{}",
-						isMove, formatMeta(bucket.getBucketMeta()), formatMeta(splitting));
-			}
-
-			// 开始同步数据，这个阶段对于rocks时同步访问的，对于网络是异步的。
-			var puts = buildSplitPut(it);
-			var fit = it;
-			dbh2Splitting.getRaftAgent().send(puts, (p) -> splitPutNext(isMove, (SplitPut)p, fit, serialNo));
-			it = null;
 		} finally {
-			if (null != it)
-				it.close();
+			unlock();
 		}
 	}
 
@@ -650,13 +691,12 @@ public class Dbh2 extends AbstractDbh2 implements Closeable {
 
 		// 设置一个超时，每秒放行一次。
 		Task.scheduleUnsafe(1000,
-				() -> getRaft().getUserThreadExecutor().execute(() -> consumePrepareAndBlockAgain(isMove)));
+				() -> getRaft().executeUserTask(() -> consumePrepareAndBlockAgain(isMove)));
 
 		// 在队列中增加endSplit启动任务，先要处理完队列中的请求。
 		// 此时PrepareBatch已经被拦截，但是还有CommitBatch,UndoBatch等其他请求在处理。
 		// setupHandleIfNoTransaction 将在没有进行中的事务时触发。
-		getRaft().getUserThreadExecutor().execute(() ->
-				stateMachine.setupOneShotIfNoTransaction(() -> endSplit0(isMove)));
+		getRaft().executeUserTask(() -> stateMachine.setupOneShotIfNoTransaction(() -> endSplit0(isMove)));
 	}
 
 	private void consumePrepareAndBlockAgain(boolean isMove) {

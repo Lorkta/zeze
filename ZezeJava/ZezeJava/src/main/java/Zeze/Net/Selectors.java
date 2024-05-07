@@ -5,12 +5,13 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Util.FastLock;
 import Zeze.Util.Task;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-public class Selectors {
+public class Selectors extends ReentrantLock {
 	public static final class InstanceHolder { // for lazy-init
 		private static final Selectors instance = new Selectors("Selector");
 	}
@@ -102,11 +103,13 @@ public class Selectors {
 		return readBufferSize;
 	}
 
-	@NotNull ArrayList<ByteBuffer> getBbGlobalPool() {
+	@NotNull
+	ArrayList<ByteBuffer> getBbGlobalPool() {
 		return bbGlobalPool;
 	}
 
-	@NotNull FastLock getBbGlobalPoolLock() {
+	@NotNull
+	FastLock getBbGlobalPoolLock() {
 		return bbGlobalPoolLock;
 	}
 
@@ -157,12 +160,17 @@ public class Selectors {
 		return tmp[index];
 	}
 
-	public synchronized void close() {
-		Selector[] tmp = selectorList;
-		if (tmp != null) {
-			selectorList = null;
-			for (Selector s : tmp)
-				s.close();
+	public void close() {
+		lock();
+		try {
+			Selector[] tmp = selectorList;
+			if (tmp != null) {
+				selectorList = null;
+				for (Selector s : tmp)
+					s.close();
+			}
+		} finally {
+			unlock();
 		}
 	}
 }

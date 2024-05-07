@@ -8,8 +8,10 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.OpenOption;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
 import Zeze.Serialize.ByteBuffer;
@@ -43,6 +45,10 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
+import io.netty.handler.codec.http.cookie.Cookie;
+import io.netty.handler.codec.http.cookie.DefaultCookie;
+import io.netty.handler.codec.http.cookie.ServerCookieDecoder;
+import io.netty.handler.codec.http.cookie.ServerCookieEncoder;
 import io.netty.handler.codec.http.multipart.DefaultHttpDataFactory;
 import io.netty.handler.codec.http.multipart.HttpDataFactory;
 import io.netty.handler.codec.http.multipart.HttpPostMultipartRequestDecoder;
@@ -92,10 +98,13 @@ public class HttpExchange {
 	protected @Nullable HttpRequest request; // 收到完整HTTP header部分会赋值
 	protected @Nullable HttpHandler handler; // 收到完整HTTP header部分会查找对应handler并赋值
 	protected @NotNull ByteBuf content = Unpooled.EMPTY_BUFFER; // 当前收集的HTTP body部分, 只用于非流模式
+	protected @Nullable Object userState;
+	protected @Nullable ArrayList<Object> resHeaders; // key,value,key,value,...
+	protected @Nullable List<Cookie> cookies;
+	protected @Nullable HttpSession.CookieSession cookieSession;
+	protected volatile @SuppressWarnings("unused") int detached; // 0:not detached; 1:detached; 2:detached and closed
 	protected boolean willCloseConnection; // true表示close时会关闭连接
 	protected boolean inStreamMode; // 是否在流/WebSocket模式过程中
-	protected @Nullable Object userState;
-	protected volatile @SuppressWarnings("unused") int detached; // 0:not detached; 1:detached; 2:detached and closed
 
 	public HttpExchange(@NotNull HttpServer server, @NotNull ChannelHandlerContext context) {
 		this.server = server;
@@ -108,6 +117,74 @@ public class HttpExchange {
 
 	public void setUserState(@Nullable Object userState) {
 		this.userState = userState;
+	}
+
+	public @Nullable HttpSession.CookieSession getCookieSession() {
+		return cookieSession;
+	}
+
+	/**
+	 * @param key 建议从Netty的HttpHeaderNames类里取字符串常量
+	 */
+	public void addHeader(@NotNull CharSequence key, @NotNull Object value) {
+		var headers = resHeaders;
+		if (headers == null)
+			resHeaders = headers = new ArrayList<>();
+		headers.add(key);
+		headers.add(value);
+	}
+
+	public void addCookie(@NotNull String name, @NotNull String value) {
+		setCookie(name, value, null, null, -1);
+	}
+
+	public void removeCookie(@NotNull String name) {
+		setCookie(name, "", null, null, 0);
+	}
+
+	/**
+	 * @param domain 域名. 可以是全的,也可以是跨域的,如".example.com". 默认是当前请求的域名(HOST)
+	 * @param path   路径. 如"/","/path/". 默认是当前请求路径到最后一个"/"的部分
+	 * @param maxAge 有效期. 小于0表示浏览器(内存)生命期(默认);0表示删除;大于0表示有效时长(秒)
+	 */
+	public void setCookie(@NotNull String name, @NotNull String value,
+						  @Nullable String domain, @Nullable String path, long maxAge) {
+		var cookie = new DefaultCookie(name, value);
+		if (domain != null)
+			cookie.setDomain(domain);
+		if (path != null)
+			cookie.setPath(path);
+		if (maxAge >= 0)
+			cookie.setMaxAge(maxAge);
+		addHeader(HttpHeaderNames.SET_COOKIE, ServerCookieEncoder.LAX.encode(cookie));
+	}
+
+	/**
+	 * @return 不可修改的Cookie容器
+	 */
+	public @NotNull List<Cookie> getCookieList() {
+		var cs = cookies;
+		if (cs != null)
+			return cs;
+		var r = request;
+		if (r == null)
+			return List.of();
+		var cookieStr = r.headers().get(HttpHeaderNames.COOKIE);
+		if (cookieStr == null || cookieStr.isBlank())
+			return List.of();
+		cookies = cs = ServerCookieDecoder.LAX.decodeAll(cookieStr);
+		return cs;
+	}
+
+	public @Nullable String getCookie(@NotNull String name) {
+		var cookies = getCookieList();
+		if (!cookies.isEmpty()) {
+			for (var cookie : cookies) {
+				if (cookie.name().equals(name))
+					return cookie.value();
+			}
+		}
+		return null;
 	}
 
 	public boolean isActive() {
@@ -261,12 +338,19 @@ public class HttpExchange {
 		return path.substring(i);
 	}
 
+	public void initCookieSession() {
+		var httpSession = server.getHttpSession();
+		if (httpSession != null)
+			cookieSession = httpSession.getCookieSession(this);
+	}
+
 	protected void channelRead(@Nullable Object msg) throws Exception {
 		var channel = context.channel();
 		channel.attr(HttpServer.idleTimeKey).set(null);
 		if (msg instanceof HttpRequest) {
 			var req = ReferenceCountUtil.retain((HttpRequest)msg);
 			request = req;
+			initCookieSession();
 			var path = path();
 			handler = server.getHandler(path);
 			if (handler == null) {
@@ -635,6 +719,10 @@ public class HttpExchange {
 				.set(HttpHeaderNames.CONTENT_LENGTH, content.readableBytes());
 		if (contentType != null)
 			headers.set(HttpHeaderNames.CONTENT_TYPE, contentType);
+		if (resHeaders != null) {
+			for (int i = 0, n = resHeaders.size(); i < n; i += 2)
+				headers.add((CharSequence)resHeaders.get(i), resHeaders.get(i + 1));
+		}
 		return context.writeAndFlush(res);
 	}
 

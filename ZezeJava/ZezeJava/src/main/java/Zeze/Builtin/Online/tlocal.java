@@ -17,6 +17,16 @@ public final class tlocal extends TableX<String, Zeze.Builtin.Online.BLocals>
     }
 
     @Override
+    public Class<String> getKeyClass() {
+        return String.class;
+    }
+
+    @Override
+    public Class<Zeze.Builtin.Online.BLocals> getValueClass() {
+        return Zeze.Builtin.Online.BLocals.class;
+    }
+
+    @Override
     public boolean isMemory() {
         return true;
     }

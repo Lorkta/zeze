@@ -16,12 +16,13 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import Zeze.Util.OutInt;
 import java.util.concurrent.Future;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 日志文件集合，能搜索当前存在的所有日志。
  * 静态管理所有Log4jFile。Index。监控rotate。
  */
-public class Log4jFileManager {
+public class Log4jFileManager extends ReentrantLock {
 	public static class Log4jFile {
 		public volatile File file;
 		public volatile LogIndex index;
@@ -111,7 +112,8 @@ public class Log4jFileManager {
 		return -1; // 其他。
 	}
 
-	private synchronized void onFileCreated(Path path) {
+	private void onFileCreated(Path path) {
+		lock();
 		try {
 			var fileName = path.toFile().getName();
 			var type = testFileName(fileName, null);
@@ -135,7 +137,7 @@ public class Log4jFileManager {
 					var indexFile = Path.of(logConf.logDir, getCurrentIndexFileName()).toFile();
 					if (indexFile.exists()) {
 						if (!indexFile.renameTo(new File(logConf.logDir, fileName + ".index")))
-							logger.error("rename error. " + indexFile);
+							logger.error("rename error: {}", indexFile);
 					}
 					// 修改file指向新的logFile。index保持不变。
 					last.file = new File(logConf.logDir, fileName);
@@ -144,6 +146,8 @@ public class Log4jFileManager {
 			}
 		} catch (Exception ex) {
 			logger.error("", ex);
+		} finally {
+			unlock();
 		}
 	}
 
@@ -204,7 +208,7 @@ public class Log4jFileManager {
 			for (var link : links) {
 				if (link != maxFile) {
 					if (!link.delete())
-						logger.warn("delete link error: " + link);
+						logger.warn("delete link error: {}", link);
 				}
 			}
 		}
@@ -270,7 +274,8 @@ public class Log4jFileManager {
 		return index;
 	}
 
-	private synchronized void buildIndex() {
+	private void buildIndex() {
+		lock();
 		try {
 			if (files.isEmpty())
 				return;
@@ -282,6 +287,8 @@ public class Log4jFileManager {
 			loadIndex(last.file, last.index);
 		} catch (Exception ex) {
 			logger.error("", ex);
+		} finally {
+			unlock();
 		}
 	}
 }

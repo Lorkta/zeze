@@ -337,7 +337,7 @@ public class HotManager extends ClassLoader {
 		}
 	}
 
-	private ArrayList<HotModule> install(List<String> namespaces) throws Exception {
+	private ArrayList<HotModule> install(List<String> namespaces, boolean atomicAll) throws Exception {
 		logger.info("________________ install ________________ {}", namespaces);
 		try {
 			upgrading = true;
@@ -409,6 +409,10 @@ public class HotManager extends ClassLoader {
 							newModules.add(module);
 						}
 					}
+
+					if (atomicAll)
+						hotDistribute.sendTryDistributeResultAndWaitCommit(0);
+
 					txn.commit();
 				} catch (Throwable ex) {
 					logger.error("", ex);
@@ -475,12 +479,20 @@ public class HotManager extends ClassLoader {
 						var moduleConfig = module.loadModuleConfig();
 						zeze.getProviderApp().providerService.addHotModule((IModule)module.getService(), moduleConfig);
 					}
+
+					// 本来这个代码应该放在下面的final commit point. 那里。
+					// 但有个超时错误需要处理，这个错误也停止进程。
+					// 由于后续的startLast是忽略错误的，所以代码移到这里也是可以的。
+					if (atomicAll) {
+						hotDistribute.sendCommitResultAndWaitCommit2(0);
+					}
 				} catch (Throwable ex) {
 					logger.error("too much changes. impossible to rollback.", ex);
 					LogManager.shutdown();
 					Runtime.getRuntime().halt(111222);
 				}
 			}
+			// 最后启动，startLast.
 			for (var module : result) {
 				try {
 					module.startLast();
@@ -488,6 +500,7 @@ public class HotManager extends ClassLoader {
 					logger.error("", ex);
 				}
 			}
+			// final commit point.
 			return result;
 		} finally {
 			upgrading = false;
@@ -623,16 +636,21 @@ public class HotManager extends ClassLoader {
 	 * 支持远程，多服务器发布。
 	 * 支持原子发布。
 	 */
-	public long tryDistribute() {
+	public long tryDistribute(boolean atomicAll) {
+		var rc = 0L;
 		try {
 			var ready = Path.of(distributeDir, "ready");
 			if (Files.exists(ready)) {
 				try {
 					readyLines = Files.readAllLines(ready);
-					if (null != installReadies())
+					if (null != installReadies(atomicAll))
 						Files.deleteIfExists(ready); // success
-					else
+					else {
+						rc = IModule.errorCode(HotDistribute.ModuleId, HotDistribute.eInstall);
+						// 安装失败，使用这个错误码报告最终错误。
+						// 可能不需要报告，里面的流程已经报告完成。
 						renameDistributes();
+					}
 					return 0;
 				} catch (Throwable ex) {
 					logger.error("", ex);
@@ -641,6 +659,9 @@ public class HotManager extends ClassLoader {
 			}
 		} catch (Throwable ex) {
 			logger.error("distributeDir = '{}'", distributeDir, ex);
+			rc = Procedure.Exception;
+		} finally {
+			hotDistribute.setIdle(rc);
 		}
 		return Procedure.Exception;
 	}
@@ -655,7 +676,7 @@ public class HotManager extends ClassLoader {
 		}
 
 		Task.getScheduledThreadPool().scheduleAtFixedRate(
-				this::tryDistribute, 10000, 10000, TimeUnit.MILLISECONDS);
+				() -> tryDistribute(false), 10000, 10000, TimeUnit.MILLISECONDS);
 		Task.hotGuard = this::enterReadLock;
 		hotManagerService.start();
 	}
@@ -800,7 +821,7 @@ public class HotManager extends ClassLoader {
 		return super.findClass(className);
 	}
 
-	public ArrayList<HotModule> installReadies() throws Exception {
+	public ArrayList<HotModule> installReadies(boolean atomicAll) throws Exception {
 		var foundJars = new HashSet<String>();
 		var readies = new HashSet<String>();
 		loadExistDistributes(foundJars, readies);
@@ -818,7 +839,7 @@ public class HotManager extends ClassLoader {
 		}
 		// add remain
 		readiesOrder.addAll(readies);
-		return install(readiesOrder);
+		return install(readiesOrder, atomicAll);
 	}
 
 	private static void tryReady(HashSet<String> foundJars, String jarFileName, HashSet<String> readies) {

@@ -2,9 +2,10 @@ package Zeze.Hot;
 
 import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Application;
 
-public class HotHandle<THandle> {
+public class HotHandle<THandle> extends ReentrantLock {
 	private final ConcurrentHashMap<String, THandle> handleCache = new ConcurrentHashMap<>();
 	private final ConcurrentHashMap<HotModule, HashSet<String>> classNameWithHotModule = new ConcurrentHashMap<>();
 
@@ -22,7 +23,6 @@ public class HotHandle<THandle> {
 		return (null == zeze.getHotManager())
 				? Class.forName(handleClassName)
 				: zeze.getHotManager().getHotRedirect().loadClass(handleClassName);
-
 	}
 
 	@SuppressWarnings("unchecked")
@@ -31,7 +31,9 @@ public class HotHandle<THandle> {
 		if (null != handle)
 			return handle;
 
-		synchronized (handleCache) {
+		// synchronize_d (handleCache)
+		lock();
+		try {
 			handle = handleCache.get(handleClassName);
 			if (null != handle)
 				return handle;
@@ -48,6 +50,8 @@ public class HotHandle<THandle> {
 			handle = (THandle)handleClass.getConstructor().newInstance();
 			handleCache.put(handleClassName, handle);
 			return handle;
+		} finally {
+			unlock();
 		}
 	}
 }

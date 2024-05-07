@@ -16,6 +16,16 @@ public final class tAccountAuth extends TableX<String, Zeze.Builtin.Auth.BAccoun
         super(663215574, "Zeze_Builtin_Auth_tAccountAuth", suffix);
     }
 
+    @Override
+    public Class<String> getKeyClass() {
+        return String.class;
+    }
+
+    @Override
+    public Class<Zeze.Builtin.Auth.BAccountAuth> getValueClass() {
+        return Zeze.Builtin.Auth.BAccountAuth.class;
+    }
+
     public static final int VAR_Roles = 1;
 
     @Override

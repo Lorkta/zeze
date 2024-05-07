@@ -111,13 +111,14 @@ public class RedirectBase {
 
 		AsyncSocket socket;
 		var service = providerApp.providerDirectService;
-		var ps = (ProviderModuleState)servers.localStates.get(serviceInfo.getServiceIdentity());
+		var ps = (ProviderModuleState)servers.getLocalStates().get(serviceInfo.getServiceIdentity());
 		if (ps != null && (socket = service.GetSocket(ps.sessionId)) != null && !socket.isClosed())
 			return socket;
 
 		if (dataConcurrentLevel <= 1) {
-			synchronized (servers) {
-				for (int i = 0, n = servers.localStates.size(); i < n; i++) {
+			servers.lock();
+			try {
+				for (int i = 0, n = servers.getLocalStates().size(); i < n; i++) {
 					var e = servers.getNextStateEntry();
 					if (e == null)
 						break;
@@ -125,13 +126,15 @@ public class RedirectBase {
 					if (socket != null && !socket.isClosed())
 						return socket;
 				}
+			} finally {
+				servers.unlock();
 			}
 		}
 
 		throw new RedirectException(RedirectException.SERVER_NOT_FOUND,
 				"choiceHash: not found socket for serviceName=" + serviceName + ", hash=" + hash
 						+ ", conc=" + dataConcurrentLevel + ", serverId=" + serviceInfo.getServiceIdentity()
-						+ ", count=" + servers.localStates.size());
+						+ ", count=" + servers.getLocalStates().size());
 	}
 
 	private static void addMiss(@NotNull ModuleRedirectAllResult miss, int i,
@@ -156,9 +159,9 @@ public class RedirectBase {
 		exist.Argument.getHashCodes().add(index);
 	}
 
-	public <T extends RedirectResult> @NotNull RedirectAllFuture<T> redirectAll(@NotNull IModule module,
-																				@NotNull ModuleRedirectAllRequest req,
-																				@NotNull RedirectAllContext<T> ctx) {
+	public <T extends RedirectResult> RedirectAllFuture<T> redirectAll(@NotNull IModule module,
+																	   @NotNull ModuleRedirectAllRequest req,
+																	   @NotNull RedirectAllContext<T> ctx) {
 		var future = ctx.getFuture();
 		var arg = req.Argument;
 		if (arg.getHashCodeConcurrentLevel() <= 0) {
@@ -183,7 +186,7 @@ public class RedirectBase {
 				addTransmits(transmits, 0, i, req);
 				continue; // loop-back
 			}
-			var localState = providers.localStates.get(target.getServiceIdentity());
+			var localState = providers.getLocalStates().get(target.getServiceIdentity());
 			if (localState == null) {
 				addMiss(miss, i, Procedure.ProviderNotExist);
 				continue; // not ready

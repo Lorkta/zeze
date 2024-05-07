@@ -10,25 +10,25 @@ import Zeze.Serialize.ByteBuffer;
 
 /**
  * 具体做法是正常定义母表，然后动态表使用相同的 K,V 创建。
- *
- * @param <K>
- * @param <V>
  */
 public class TableDynamic<K extends Comparable<K>, V extends Bean> extends TableX<K, V> {
 	private final Function<K, ByteBuffer> keyEncoder;
 	private final Function<ByteBuffer, K> keyDecoder;
 	private final Factory<V> valueFactory;
 	private final boolean isAutoKey;
+	private final Class<? extends Comparable<?>> keyClass;
+	private final Class<? extends Bean> valueClass;
 
 	public TableDynamic(Application zeze, String tableName,
-						TableX<K, V> template
-						) {
+						TableX<K, V> template) {
 		this(zeze, tableName,
 				template::encodeKey,
 				template::decodeKey,
 				template::newValue,
 				template.isAutoKey(),
-				template.getName());
+				template.getName(),
+				template.getKeyClass(),
+				template.getValueClass());
 	}
 
 	/**
@@ -48,16 +48,30 @@ public class TableDynamic<K extends Comparable<K>, V extends Bean> extends Table
 						Function<ByteBuffer, K> keyDecoder,
 						Factory<V> valueFactory,
 						boolean isAutoKey,
-						String confTableName) {
+						String confTableName,
+						Class<? extends Comparable<?>> keyClass,
+						Class<? extends Bean> valueClass) {
 		super(Bean.hash32(tableName), tableName);
 
 		this.keyEncoder = keyEncoder;
 		this.keyDecoder = keyDecoder;
 		this.valueFactory = valueFactory;
 		this.isAutoKey = isAutoKey;
+		this.keyClass = keyClass;
+		this.valueClass = valueClass;
 
 		confTableName = confTableName == null ? tableName : confTableName;
 		zeze.openDynamicTable(zeze.getConfig().getTableConf(confTableName).getDatabaseName(), this);
+	}
+
+	@Override
+	public Class<? extends Comparable<?>> getKeyClass() {
+		return keyClass;
+	}
+
+	@Override
+	public Class<? extends Bean> getValueClass() {
+		return valueClass;
 	}
 
 	@Override

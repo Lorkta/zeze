@@ -1,11 +1,12 @@
 package Zeze.Raft;
 
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 import Zeze.Util.LongConcurrentHashMap;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-public abstract class StateMachine {
+public abstract class StateMachine extends ReentrantLock {
 	private static final Logger logger = LogManager.getLogger(StateMachine.class);
 
 	private Raft raft;
@@ -33,7 +34,7 @@ public abstract class StateMachine {
 		Supplier<Log> factory = logFactorys.get(logTypeId);
 		if (factory != null)
 			return factory.get();
-		logger.fatal("Unknown Log: " + logTypeId, new Exception());
+		logger.fatal("Unknown Log: {}", logTypeId, new Exception());
 		raft.fatalKill();
 		return null;
 	}

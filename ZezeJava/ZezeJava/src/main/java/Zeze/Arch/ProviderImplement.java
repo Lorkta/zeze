@@ -11,10 +11,12 @@ import Zeze.Net.AsyncSocket;
 import Zeze.Net.Binary;
 import Zeze.Net.FamilyClass;
 import Zeze.Net.Protocol;
+import Zeze.Net.ProtocolHandle;
 import Zeze.Net.Rpc;
 import Zeze.Serialize.ByteBuffer;
-import Zeze.Services.ServiceManager.Agent;
+import Zeze.Services.ServiceManager.BEditService;
 import Zeze.Services.ServiceManager.BServiceInfo;
+import Zeze.Services.ServiceManager.BSubscribeArgument;
 import Zeze.Services.ServiceManager.BSubscribeInfo;
 import Zeze.Transaction.EmptyBean;
 import Zeze.Transaction.Procedure;
@@ -30,7 +32,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public abstract class ProviderImplement extends AbstractProviderImplement {
-	protected static final Logger logger = LogManager.getLogger(ProviderImplement.class);
+	protected static final @NotNull Logger logger = LogManager.getLogger(ProviderImplement.class);
 	private static final ThreadLocal<Dispatch> localDispatch = new ThreadLocal<>();
 
 	protected ProviderApp providerApp;
@@ -41,30 +43,6 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 	}
 
 	public abstract @Nullable ProviderLoadBase getLoad();
-
-	void addServer(@NotNull Agent.SubscribeState ss, @NotNull BServiceInfo pm) {
-		if (ss.getServiceName().equals(providerApp.linkdServiceName))
-			providerApp.providerService.apply(pm);
-	}
-
-	void applyOnChanged(@NotNull Agent.SubscribeState subState) {
-		if (subState.getServiceName().equals(providerApp.linkdServiceName)) {
-			// Linkd info
-			providerApp.providerService.apply(subState.getServiceInfos());
-		} else if (subState.getServiceName().startsWith(providerApp.serverServiceNamePrefix)) {
-			// Provider info
-			// 对于 SubscribeTypeSimple 是不需要 SetReady 的，为了能一致处理，就都设置上了。
-			// 对于 SubscribeTypeReadyCommit 在 ApplyOnPrepare 中处理。
-			if (subState.getSubscribeType() == BSubscribeInfo.SubscribeTypeSimple)
-				providerApp.providerDirectService.tryConnectAndSetReady(subState, subState.getServiceInfos());
-		}
-	}
-
-	void applyOnPrepare(@NotNull Agent.SubscribeState subState) {
-		var pending = subState.getServiceInfosPending();
-		if (pending != null && pending.getServiceName().startsWith(providerApp.serverServiceNamePrefix))
-			providerApp.providerDirectService.tryConnectAndSetReady(subState, pending);
-	}
 
 	public static @Nullable Dispatch localDispatch() {
 		return localDispatch.get();
@@ -81,23 +59,28 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 	public void registerModulesAndSubscribeLinkd() {
 		var sm = providerApp.zeze.getServiceManager();
 		var identity = String.valueOf(providerApp.zeze.getConfig().getServerId());
+		var edit = new BEditService();
+		var appVersion = providerApp.zeze.getConfig().getAppVersion();
 		// 注册本provider的静态服务
 		for (var it = providerApp.staticBinds.iterator(); it.moveToNext(); ) {
-			sm.registerService(providerApp.serverServiceNamePrefix + it.key(), identity,
-					providerApp.directIp, providerApp.directPort);
+			edit.getAdd().add(new BServiceInfo(providerApp.serverServiceNamePrefix + it.key(), identity, appVersion,
+					providerApp.directIp, providerApp.directPort));
 		}
 		// 注册本provider的动态服务
 		for (var it = providerApp.dynamicModules.iterator(); it.moveToNext(); ) {
-			sm.registerService(providerApp.serverServiceNamePrefix + it.key(), identity,
-					providerApp.directIp, providerApp.directPort);
+			edit.getAdd().add(new BServiceInfo(providerApp.serverServiceNamePrefix + it.key(), identity, appVersion,
+					providerApp.directIp, providerApp.directPort));
 		}
+		sm.editService(edit);
 
+		// 订阅服务
+		var sub = new BSubscribeArgument();
 		// 订阅provider直连发现服务
 		for (var it = providerApp.modules.iterator(); it.moveToNext(); )
-			sm.subscribeService(providerApp.serverServiceNamePrefix + it.key(), it.value().getSubscribeType());
-
+			sub.subs.add(new BSubscribeInfo(providerApp.serverServiceNamePrefix + it.key(), appVersion));
 		// 订阅linkd发现服务。
-		sm.subscribeService(providerApp.linkdServiceName, BSubscribeInfo.SubscribeTypeSimple);
+		sub.subs.add(new BSubscribeInfo(providerApp.linkdServiceName, 0)); // link 服务没有使用版本号。
+		sm.subscribeServices(sub);
 	}
 
 	public static void sendKick(@Nullable AsyncSocket sender, long linkSid, int code, @NotNull String desc) {
@@ -114,11 +97,11 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 	}
 
 	@SuppressWarnings("MethodMayBeStatic")
-	public ProviderUserSession newSession(@NotNull Dispatch p) {
+	public @NotNull ProviderUserSession newSession(@NotNull Dispatch p) {
 		return new ProviderUserSession(p);
 	}
 
-	private String getAuthFlags(String account, long typeId) {
+	private @Nullable String getAuthFlags(@NotNull String account, long typeId) {
 		var auth = providerApp.zeze.getAuth();
 		if (null == auth)
 			return "";
@@ -127,7 +110,7 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 
 	@TransactionLevelAnnotation(Level = TransactionLevel.None)
 	@Override
-	protected long ProcessDispatch(Dispatch p) {
+	protected long ProcessDispatch(@NotNull Dispatch p) {
 		var sender = p.getSender();
 		var arg = p.Argument;
 		var linkSid = arg.getLinkSid();
@@ -163,7 +146,7 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 						if ((header & FamilyClass.BitResultCode) != 0)
 							bb.SkipLong(); // resultCode
 						var sessionId = bb.ReadLong();
-						bb = ByteBuffer.Allocate();
+						bb = ByteBuffer.Allocate(24);
 						bb.WriteInt4(Protocol.getModuleId(typeId));
 						bb.WriteInt4(Protocol.getProtocolId(typeId));
 						int saveSize = bb.BeginWriteWithSize4();
@@ -216,8 +199,9 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 					if (isRpcResponse)
 						return processRpcResponse(outRpcContext, p3);
 					// protocol or rpc request
-					var handler = factoryHandle.Handle;
-					return handler != null ? handler.handleProtocol(p3) : Procedure.NotImplement;
+					@SuppressWarnings("unchecked")
+					var handler = (ProtocolHandle<Protocol<?>>)factoryHandle.Handle;
+					return handler != null ? handler.handle(p3) : Procedure.NotImplement;
 				}, null, factoryHandle.Level, session), outProtocol, session::trySendResponse);
 				if (PerfCounter.ENABLE_PERF) {
 					PerfCounter.instance.addRecvInfo(typeId, factoryHandle.Class,
@@ -249,8 +233,9 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 				if (isRpcResponse)
 					return processRpcResponse(outRpcContext, p3);
 				// protocol or rpc request
-				var handler = factoryHandle.Handle;
-				return handler != null ? handler.handleProtocol(p3) : Procedure.NotImplement;
+				@SuppressWarnings("unchecked")
+				var handler = (ProtocolHandle<Protocol<?>>)factoryHandle.Handle;
+				return handler != null ? handler.handle(p3) : Procedure.NotImplement;
 			}, p3, session::trySendResponse);
 			if (PerfCounter.ENABLE_PERF) {
 				PerfCounter.instance.addRecvInfo(typeId, factoryHandle.Class,
@@ -284,7 +269,7 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 	}
 
 	@Override
-	protected long ProcessAnnounceLinkInfo(AnnounceLinkInfo protocol) {
+	protected long ProcessAnnounceLinkInfo(@NotNull AnnounceLinkInfo protocol) {
 		if (!AsyncSocket.ENABLE_PROTOCOL_LOG) {
 			logger.info("AnnounceLinkInfo[{}]: {}",
 					protocol.getSender().getSessionId(), AsyncSocket.toStr(protocol.Argument));

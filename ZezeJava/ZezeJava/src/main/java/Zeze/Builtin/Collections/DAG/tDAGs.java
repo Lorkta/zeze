@@ -17,6 +17,16 @@ public final class tDAGs extends TableX<String, Zeze.Builtin.Collections.DAG.BDA
         super(1716762493, "Zeze_Builtin_Collections_DAG_tDAGs", suffix);
     }
 
+    @Override
+    public Class<String> getKeyClass() {
+        return String.class;
+    }
+
+    @Override
+    public Class<Zeze.Builtin.Collections.DAG.BDAG> getValueClass() {
+        return Zeze.Builtin.Collections.DAG.BDAG.class;
+    }
+
     public static final int VAR_NodeSum = 1;
     public static final int VAR_EdgeSum = 2;
     public static final int VAR_StartNode = 3;

@@ -6,6 +6,10 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.security.MessageDigest;
 import Zeze.Builtin.HotDistribute.Commit;
+import Zeze.Builtin.HotDistribute.Commit2;
+import Zeze.Builtin.HotDistribute.PrepareDistribute;
+import Zeze.Builtin.HotDistribute.TryDistribute;
+import Zeze.Builtin.HotDistribute.TryRollback;
 import Zeze.Builtin.Zoker.AppendFile;
 import Zeze.Builtin.Zoker.CloseFile;
 import Zeze.Builtin.Zoker.OpenFile;
@@ -24,12 +28,14 @@ public class HotAgent extends AbstractHotAgent {
 	}
 
 	private final HotAgentService hotAgentService;
+	private final String peer;
 	private final Connector connector;
 
 	public HotAgent(String ipPort) {
 		var ipPorts = ipPort.split("[_:]");
 		var ip = ipPorts[0];
 		var port = Integer.parseInt(ipPorts[1]);
+		this.peer = ipPort;
 
 		hotAgentService = new HotAgentService();
 		RegisterProtocols(hotAgentService);
@@ -39,9 +45,14 @@ public class HotAgent extends AbstractHotAgent {
 		connector = out.value;
 	}
 
+	public String getPeer() {
+		return peer;
+	}
+
 	public HotAgent(String ip, int port) {
 		hotAgentService = new HotAgentService();
 		RegisterProtocols(hotAgentService);
+		this.peer = ip + "_" + port;
 
 		var out = new OutObject<Connector>();
 		hotAgentService.getConfig().tryGetOrAddConnector(ip, port, true, out);
@@ -99,12 +110,49 @@ public class HotAgent extends AbstractHotAgent {
 			throw new RuntimeException("close file error. " + IModule.getErrorCode(r.getResultCode()));
 	}
 
-	public void commit() {
+	public void prepareDistribute(long id) {
 		var hotManager = connector.TryGetReadySocket();
-		var r = new Commit();
+		var r = new PrepareDistribute();
+		r.Argument.setDistributeId(id);
 		r.SendForWait(hotManager).await();
 		if (r.getResultCode() != 0)
-			throw new RuntimeException("commit error " + IModule.getErrorCode(r.getResultCode()));
+			throw new RuntimeException("prepareDistribute error " + IModule.getErrorCode(r.getResultCode()));
+	}
+
+	public TryDistribute tryDistribute(long id, boolean atomicAll) {
+		var hotManager = connector.TryGetReadySocket();
+		var r = new TryDistribute();
+		r.Argument.setDistributeId(id);
+		r.Argument.setAtomicAll(atomicAll);
+		r.SendForWait(hotManager);
+		return r;
+	}
+
+	public Commit commit(long id) {
+		var hotManager = connector.TryGetReadySocket();
+		var r = new Commit();
+		r.Argument.setDistributeId(id);
+		r.SendForWait(hotManager);
+		return r;
+	}
+
+	public void commit2(long id) {
+		var hotManager = connector.TryGetReadySocket();
+		var r = new Commit2();
+		r.Argument.setDistributeId(id);
+		r.SendForWait(hotManager).await();
+		if (r.getResultCode() != 0)
+			throw new RuntimeException("commit2=" + IModule.getErrorCode(r.getResultCode()));
+	}
+
+	public void tryRollback(long id) {
+		var hotManager = connector.TryGetReadySocket();
+		var r = new TryRollback();
+		r.Argument.setDistributeId(id);
+		r.SendForWait(hotManager).await();
+		if (r.getResultCode() != 0) {
+			throw new RuntimeException("tryRollback=" + IModule.getErrorCode(r.getResultCode()));
+		}
 	}
 
 	public void distribute(File distributeDir) throws Exception {

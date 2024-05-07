@@ -28,13 +28,20 @@ import org.jetbrains.annotations.Nullable;
 
 public final class Task {
 	// 通常不建议开,事务并发量太大时并发冲突可能很高导致频繁redo
-	private static final boolean USE_UNLIMITED_VIRTUAL_THREAD = PropertiesHelper.getBool("useUnlimitedVirtualThread", false);
 	private static final boolean USE_VIRTUAL_THREAD = PropertiesHelper.getBool("useVirtualThread", true);
+	private static final boolean USE_UNLIMITED_VIRTUAL_THREAD = USE_VIRTUAL_THREAD
+			&& PropertiesHelper.getBool("useUnlimitedVirtualThread", !inJUnitTest());
 
 	// 默认不开启热更，这个实现希望能被优化掉，几乎不造成影响。
 	// 开启热更时，由App.HotManager初始化的时候设置。
 	@SuppressWarnings("CanBeFinal")
 	public static volatile Factory<HotGuard> hotGuard = () -> null;
+	private static final FastLock taskLock = new FastLock();
+	private static final TaskOneByOneByKey oneByOne = new TaskOneByOneByKey();
+
+	public static TaskOneByOneByKey getOneByOne() {
+		return oneByOne;
+	}
 
 	public interface ILogAction {
 		void run(Throwable ex, long result, Protocol<?> p, String actionName);
@@ -60,6 +67,10 @@ public final class Task {
 		return ThreadFactoryWithName.isVirtualThreadEnabled();
 	}
 
+	public static boolean inJUnitTest() {
+		return System.getProperty("sun.java.command").split(" ")[0].endsWith(".JUnitStarter");
+	}
+
 	public static ExecutorService getThreadPool() {
 		return threadPoolDefault;
 	}
@@ -74,7 +85,7 @@ public final class Task {
 
 	// 固定数量的线程池, 普通优先级, 自动优先使用支持虚拟线程(不限制数量), 用于处理普通任务
 	public static @NotNull ExecutorService newFixedThreadPool(int threadCount, @NotNull String threadNamePrefix) {
-		if (USE_UNLIMITED_VIRTUAL_THREAD) {
+		if (USE_UNLIMITED_VIRTUAL_THREAD && isVirtualThreadEnabled()) {
 			try {
 				var es = (ExecutorService)Executors.class.getMethod("newVirtualThreadPerTaskExecutor",
 						(Class<?>[])null).invoke(null);
@@ -87,23 +98,37 @@ public final class Task {
 				new ThreadFactoryWithName(threadNamePrefix, Thread.NORM_PRIORITY, USE_VIRTUAL_THREAD));
 	}
 
-	// 关键线程池, 普通优先级+2, 不使用虚拟线程, 线程数按需增长, 用于处理关键任务, 比普通任务的处理更及时
+	// 关键线程池, 不使用虚拟线程时设为普通优先级+2, 线程数按需增长, 用于处理关键任务, 比普通任务的处理更及时
 	public static @NotNull ExecutorService newCriticalThreadPool(@NotNull String threadNamePrefix) {
+		if (USE_VIRTUAL_THREAD) {
+			try {
+				var es = (ExecutorService)Executors.class.getMethod("newVirtualThreadPerTaskExecutor",
+						(Class<?>[])null).invoke(null);
+				logger.info("newCriticalThreadPool({}) use unlimited virtual thread pool", threadNamePrefix);
+				return es;
+			} catch (ReflectiveOperationException ignored) {
+			}
+		}
 		return Executors.newCachedThreadPool(new ThreadFactoryWithName(threadNamePrefix, Thread.NORM_PRIORITY + 2));
 	}
 
-	public static synchronized void initThreadPool(@NotNull ExecutorService pool,
-												   @NotNull ScheduledExecutorService scheduled) {
-		//noinspection ConstantValue
-		if (pool == null || scheduled == null)
-			throw new IllegalArgumentException();
+	public static void initThreadPool(@NotNull ExecutorService pool,
+									  @NotNull ScheduledExecutorService scheduled) {
+		taskLock.lock();
+		try {
+			//noinspection ConstantValue
+			if (pool == null || scheduled == null)
+				throw new IllegalArgumentException();
 
-		if (threadPoolDefault != null || threadPoolScheduled != null)
-			throw new IllegalStateException("ThreadPool Has Inited.");
-		threadPoolDefault = pool;
-		threadPoolScheduled = scheduled;
-		threadPoolCritical = newCriticalThreadPool("ZezeCriticalPool");
-		ThreadDiagnosable.startDiagnose(30_000);
+			if (threadPoolDefault != null || threadPoolScheduled != null)
+				throw new IllegalStateException("ThreadPool Has Inited.");
+			threadPoolDefault = pool;
+			threadPoolScheduled = scheduled;
+			threadPoolCritical = newCriticalThreadPool("ZezeCriticalPool");
+			ThreadDiagnosable.startDiagnose(30_000);
+		} finally {
+			taskLock.unlock();
+		}
 	}
 
 	public static boolean tryInitThreadPool() {
@@ -114,30 +139,39 @@ public final class Task {
 		return tryInitThreadPool(app, null, null);
 	}
 
-	public static synchronized boolean tryInitThreadPool(@Nullable Application app, @Nullable ExecutorService pool,
-														 @Nullable ScheduledExecutorService scheduled) {
-		if (threadPoolDefault != null || threadPoolScheduled != null)
-			return false;
+	public static boolean tryInitThreadPool(@Nullable Application app, @Nullable ExecutorService pool,
+											@Nullable ScheduledExecutorService scheduled) {
+		taskLock.lock();
+		try {
+			if (threadPoolDefault != null || threadPoolScheduled != null)
+				return false;
 
-		if (pool == null) {
-			int workerThreads = app == null ? 240 : (app.getConfig().getWorkerThreads() > 0
-					? app.getConfig().getWorkerThreads()
-					: Runtime.getRuntime().availableProcessors() * 30);
-			threadPoolDefault = newFixedThreadPool(workerThreads, "ZezeTaskPool");
-		} else
-			threadPoolDefault = pool;
+			if (pool == null) {
+				int workerThreads;
+				if (app != null && app.getConfig().getWorkerThreads() > 0)
+					workerThreads = app.getConfig().getWorkerThreads();
+				else
+					workerThreads = Runtime.getRuntime().availableProcessors() * 30;
+				threadPoolDefault = newFixedThreadPool(workerThreads, "ZezeTaskPool");
+			} else
+				threadPoolDefault = pool;
 
-		if (scheduled == null) {
-			int workerThreads = app == null ? 8 : (app.getConfig().getScheduledThreads() > 0
-					? app.getConfig().getScheduledThreads()
-					: Runtime.getRuntime().availableProcessors());
-			threadPoolScheduled = Executors.newScheduledThreadPool(workerThreads,
-					new ThreadFactoryWithName("ZezeScheduledPool", Thread.NORM_PRIORITY, USE_VIRTUAL_THREAD));
-		} else
-			threadPoolScheduled = scheduled;
-		threadPoolCritical = newCriticalThreadPool("ZezeCriticalPool");
-		ThreadDiagnosable.startDiagnose(30_000);
-		return true;
+			if (scheduled == null) {
+				int workerThreads;
+				if (app != null && app.getConfig().getScheduledThreads() > 0)
+					workerThreads = app.getConfig().getScheduledThreads();
+				else
+					workerThreads = Runtime.getRuntime().availableProcessors();
+				threadPoolScheduled = Executors.newScheduledThreadPool(workerThreads,
+						new ThreadFactoryWithName("ZezeScheduledPool", Thread.NORM_PRIORITY, USE_VIRTUAL_THREAD));
+			} else
+				threadPoolScheduled = scheduled;
+			threadPoolCritical = newCriticalThreadPool("ZezeCriticalPool");
+			ThreadDiagnosable.startDiagnose(30_000);
+			return true;
+		} finally {
+			taskLock.unlock();
+		}
 	}
 
 	// 注意必须使用try包装,确保create和close配对
@@ -155,7 +189,7 @@ public final class Task {
 		try {
 			action.run();
 		} catch (Exception ex) {
-			//noinspection ConstantValue
+			//noinspection ConstantValue,UnreachableCode
 			logger.error("{} exception:", name != null ? name : action != null ? action.getClass().getName() : "", ex);
 		} finally {
 			//noinspection ConstantValue
@@ -169,7 +203,7 @@ public final class Task {
 		try {
 			return func.call();
 		} catch (Exception ex) {
-			//noinspection ConstantValue
+			//noinspection ConstantValue,UnreachableCode
 			logger.error("{} exception:", name != null ? name : func != null ? func.getClass().getName() : "", ex);
 			return Procedure.Exception;
 		} finally {
@@ -222,7 +256,7 @@ public final class Task {
 				action.run();
 				future.setResult(0L);
 			} catch (Exception e) {
-				//noinspection ConstantValue
+				//noinspection ConstantValue,UnreachableCode
 				logger.error("{} exception:", name != null ? name : action != null ? action.getClass().getName() : "", e);
 				future.setException(e);
 			} finally {
@@ -240,7 +274,7 @@ public final class Task {
 			try (var ignoredHot = hotGuard.create(); var ignored = createTimeout(timeout)) {
 				action.run();
 			} catch (Throwable e) { // logger.error
-				//noinspection ConstantValue
+				//noinspection ConstantValue,UnreachableCode
 				logger.error("{} exception:", name != null ? name : action != null ? action.getClass().getName() : "", e);
 			} finally {
 				//noinspection ConstantValue
@@ -268,7 +302,7 @@ public final class Task {
 			try {
 				action.run();
 			} catch (Exception e) {
-				//noinspection ConstantValue
+				//noinspection ConstantValue,UnreachableCode
 				logger.error("{} exception:", name != null ? name : action != null ? action.getClass().getName() : "", e);
 			} finally {
 				//noinspection ConstantValue
@@ -285,7 +319,7 @@ public final class Task {
 			try (var ignoredHot = hotGuard.create(); var ignored = createTimeout(timeout)) {
 				action.run();
 			} catch (Throwable e) { // logger.error
-				//noinspection ConstantValue
+				//noinspection ConstantValue,UnreachableCode
 				logger.error("{} exception:", name != null ? name : action != null ? action.getClass().getName() : "", e);
 			} finally {
 				//noinspection ConstantValue

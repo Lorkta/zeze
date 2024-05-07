@@ -2,7 +2,7 @@ package Zeze.Util;
 
 import java.util.Arrays;
 
-public class ReplayAttackGrowRange implements ReplayAttack {
+public class ReplayAttackGrowRange extends FastLock implements ReplayAttack {
 	private long max;
 	private final byte[] range;
 	private int position;

@@ -2,12 +2,13 @@ package Zeze.Arch;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Application;
 import Zeze.Builtin.Provider.BLoad;
 import Zeze.Builtin.Provider.BModule;
 import Zeze.Game.ProviderWithOnline;
 import Zeze.IModule;
-import Zeze.Services.ServiceManager.BSubscribeInfo;
+import Zeze.Services.ServiceManager.BEditService;
 import Zeze.Util.IntHashMap;
 import org.jetbrains.annotations.NotNull;
 
@@ -16,7 +17,7 @@ import org.jetbrains.annotations.NotNull;
  * 设置相关对象之间的引用，
  * 初始化。
  */
-public class ProviderApp {
+public class ProviderApp extends ReentrantLock {
 	public final @NotNull Application zeze;
 
 	public final @NotNull ProviderImplement providerImplement;
@@ -94,24 +95,32 @@ public class ProviderApp {
 			}
 		});
 
-		this.distribute = new ProviderDistribute(zeze, loadConfig, toOtherProviderService);
-
-		this.zeze.getServiceManager().setOnChanged((ss) -> {
-			providerImplement.applyOnChanged(ss);
-			distribute.applyServers(ss);
-		});
-		this.zeze.getServiceManager().setOnPrepare(providerImplement::applyOnPrepare);
-		this.zeze.getServiceManager().setOnUpdate((ss, si) -> {
-			distribute.addServer(ss, si);
-			providerDirectService.addServer(ss, si);
-			providerImplement.addServer(ss, si);
-		});
-		this.zeze.getServiceManager().setOnRemoved((ss, si) -> {
-			distribute.removeServer(ss, si);
-			providerDirectService.removeServer(ss, si);
-		});
-
+		this.distribute = new ProviderDistribute(zeze, loadConfig, toOtherProviderService,
+				zeze.getConfig().getAppVersion());
+		this.zeze.getServiceManager().setOnChanged(this::applyOnChanged);
 		this.providerDirect.RegisterProtocols(providerDirectService);
+	}
+
+	void applyOnChanged(@NotNull BEditService edit) {
+		var refresh = false;
+		for (var r : edit.getRemove()) {
+			if (r.getServiceName().equals(linkdServiceName))
+				refresh |= providerService.applyRemove(r);
+			else if (r.getServiceName().startsWith(serverServiceNamePrefix)) {
+				providerDirectService.removeServer(r);
+				distribute.removeServer(r);
+			}
+		}
+		for (var p : edit.getAdd()) {
+			if (p.getServiceName().equals(linkdServiceName))
+				refresh |= providerService.applyPut(p);
+			else if (p.getServiceName().startsWith(serverServiceNamePrefix)) {
+				providerDirectService.addServer(p);
+				distribute.addServer(p);
+			}
+		}
+		if (refresh)
+			providerService.refreshLinkConnectors();
 	}
 
 	/**
@@ -147,14 +156,13 @@ public class ProviderApp {
 		// 用于ProviderDirect。
 		var defaultModuleConfig = new BModule.Data(
 				BModule.ChoiceTypeDefault,
-				BModule.ConfigTypeDefault,
-				BSubscribeInfo.SubscribeTypeSimple);
+				BModule.ConfigTypeDefault);
 
 		for (var module : modules.values()) {
 			if (!this.modules.containsKey(module.getId())) { // 补充其它模块的信息
 				var m = binds.getModules().get(module.getFullName());
 				this.modules.put(module.getId(), m != null
-						? new BModule.Data(m.getChoiceType(), m.getConfigType(), m.getSubscribeType())
+						? new BModule.Data(m.getChoiceType(), m.getConfigType())
 						: defaultModuleConfig);
 			}
 		}
@@ -164,24 +172,27 @@ public class ProviderApp {
 		isUserDisableChoice = userDisableChoice;
 	}
 
-	public synchronized void startLast(@NotNull ProviderModuleBinds binds, @NotNull Map<String, IModule> modules) throws Exception {
-		buildProviderModuleBinds(binds, modules);
-		providerImplement.registerModulesAndSubscribeLinkd();
-		startLast = true;
-		zeze.getTimer().start();
-		zeze.getAppBase().startLastModules();
+	public void startLast(@NotNull ProviderModuleBinds binds, @NotNull Map<String, IModule> modules) throws Exception {
+		lock();
+		try {
+			buildProviderModuleBinds(binds, modules);
+			providerImplement.registerModulesAndSubscribeLinkd();
+			startLast = true;
+			zeze.getTimer().start();
+			zeze.getAppBase().startLastModules();
 
-		if (providerImplement instanceof ProviderWithOnline) {
-			var game = (ProviderWithOnline)providerImplement;
-			game.getOnline().startAfter();
+			if (providerImplement instanceof ProviderWithOnline)
+				((ProviderWithOnline)providerImplement).getOnline().startAfter();
+			// 这个应该在Online.Start里面设置更合理。
+			// 但是Online有多个版本，而且跨包设置需要方法，就这里直接设置了。
+			// 是启动流程的一部分。
+			isOnlineReady = true;
+
+			// 开启link，默认开启。
+			setUserDisableChoice(false);
+			providerService.trySetLinkChoice();
+		} finally {
+			unlock();
 		}
-		// 这个应该在Online.Start里面设置更合理。
-		// 但是Online有多个版本，而且跨包设置需要方法，就这里直接设置了。
-		// 是启动流程的一部分。
-		isOnlineReady = true;
-
-		// 开启link，默认开启。
-		setUserDisableChoice(false);
-		providerService.trySetLinkChoice();
 	}
 }

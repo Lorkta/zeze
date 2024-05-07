@@ -8,6 +8,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import Zeze.Application;
+import Zeze.History.History;
 import Zeze.Onz.OnzProcedure;
 import Zeze.Util.ConcurrentHashSet;
 import Zeze.Util.FastLock;
@@ -15,6 +16,7 @@ import Zeze.Util.Task;
 import Zeze.Util.TaskCompletionSource;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jetbrains.annotations.Nullable;
 
 public final class Checkpoint {
 	static final Logger logger = LogManager.getLogger(Checkpoint.class);
@@ -271,19 +273,20 @@ public final class Checkpoint {
 		}
 	}
 
-	public void flush(Transaction trans, OnzProcedure onzProcedure) {
+	public void flush(Transaction trans, OnzProcedure onzProcedure, @Nullable History history) {
 		var records = new ArrayList<Record>(trans.getAccessedRecords().size());
 		for (var ar : trans.getAccessedRecords().values()) {
 			if (ar.dirty)
 				records.add(ar.atomicTupleRecord.record);
 		}
-		flush(records, null != onzProcedure ? Set.of(onzProcedure) : Set.of());
+		flush(records, null != onzProcedure ? Set.of(onzProcedure) : Set.of(), history);
 	}
 
-	public void flush(Iterable<Record> rs, Set<OnzProcedure> onzProcedures) {
+	public void flush(Iterable<Record> rs, Set<OnzProcedure> onzProcedures, @Nullable History history) {
 		var dts = new IdentityHashMap<Database, Database.Transaction>();
 		Database.Transaction localCacheTransaction = zeze.getLocalRocksCacheDb().beginTransaction();
 
+		// history.logChanges原子的和数据一起flush。
 		try {
 			// prepare: 编码并且为每一个数据库创建一个数据库事务。
 			for (var r : rs) {
@@ -296,7 +299,15 @@ public final class Checkpoint {
 					}
 				}
 			}
+			var historyTable = zeze.getHistoryModule().getTable();
+			var historyTransaction = history != null
+					? dts.computeIfAbsent(historyTable.getDatabase(), Database::beginTransaction)
+					: null;
+
 			// 编码
+			if (null != history)
+				history.encode0();
+
 			for (var r : rs) {
 				r.encode0();
 			}
@@ -304,6 +315,11 @@ public final class Checkpoint {
 			// 保存到数据库中
 			for (var r : rs) {
 				r.flush(r.getDatabaseTransactionTmp(), localCacheTransaction);
+			}
+			if (null != history) {
+				var storage = ((Table)historyTable).getStorage();
+				assert storage != null;
+				history.flush(storage.getDatabaseTable(), historyTransaction);
 			}
 			// 提交。
 			for (var t : dts.values()) {
@@ -354,7 +370,7 @@ public final class Checkpoint {
 	public void flush(RelativeRecordSet rs) {
 		// rs.MergeTo == null &&  check outside
 		if (rs.getRecordSet() != null) {
-			flush(rs.getRecordSet(), rs.getOnzProcedures());
+			flush(rs.getRecordSet(), rs.getOnzProcedures(), rs.getHistory());
 			for (var r : rs.getRecordSet()) {
 				r.setDirty(false);
 			}

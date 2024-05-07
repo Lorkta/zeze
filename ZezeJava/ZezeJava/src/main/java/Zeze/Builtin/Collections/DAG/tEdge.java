@@ -17,6 +17,16 @@ public final class tEdge extends TableX<Zeze.Builtin.Collections.DAG.BDAGEdgeKey
         super(1544681320, "Zeze_Builtin_Collections_DAG_tEdge", suffix);
     }
 
+    @Override
+    public Class<Zeze.Builtin.Collections.DAG.BDAGEdgeKey> getKeyClass() {
+        return Zeze.Builtin.Collections.DAG.BDAGEdgeKey.class;
+    }
+
+    @Override
+    public Class<Zeze.Builtin.Collections.DAG.BDAGEdge> getValueClass() {
+        return Zeze.Builtin.Collections.DAG.BDAGEdge.class;
+    }
+
     public static final int VAR_From = 1;
     public static final int VAR_To = 2;
 

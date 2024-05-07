@@ -16,6 +16,16 @@ public final class tAccountOfflineTimers extends TableX<Zeze.Builtin.Timer.BAcco
         super(-865861330, "Zeze_Builtin_Timer_tAccountOfflineTimers", suffix);
     }
 
+    @Override
+    public Class<Zeze.Builtin.Timer.BAccountClientId> getKeyClass() {
+        return Zeze.Builtin.Timer.BAccountClientId.class;
+    }
+
+    @Override
+    public Class<Zeze.Builtin.Timer.BOfflineTimers> getValueClass() {
+        return Zeze.Builtin.Timer.BOfflineTimers.class;
+    }
+
     public static final int VAR_OfflineTimers = 1;
 
     @Override

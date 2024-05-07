@@ -28,7 +28,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 	}
 
 	@Override
-	public Database.Table openTable(String name) {
+	public Database.Table openTable(String name, int id) {
 		return new TableMysql(name);
 	}
 
@@ -125,6 +125,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				}
 			} catch (SQLException e) {
 				Task.forceThrow(e);
+				//noinspection UnreachableCode
 				return -1; // never run here
 			}
 		}
@@ -759,6 +760,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				return count;
 			} catch (SQLException e) {
 				Task.forceThrow(e);
+				//noinspection UnreachableCode
 				return -1; // never run here
 			}
 		}
@@ -781,6 +783,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				return count;
 			} catch (SQLException e) {
 				Task.forceThrow(e);
+				//noinspection UnreachableCode
 				return -1; // never run here
 			}
 		}
@@ -917,6 +920,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				}
 			} catch (SQLException e) {
 				Task.forceThrow(e);
+				//noinspection UnreachableCode
 				return -1; // never run here
 			}
 		}
@@ -943,6 +947,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				}
 			} catch (SQLException e) {
 				Task.forceThrow(e);
+				//noinspection UnreachableCode
 				return -1; // never run here
 			}
 		}
@@ -1272,6 +1277,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				}
 			} catch (SQLException e) {
 				Task.forceThrow(e);
+				//noinspection UnreachableCode
 				return -1; // never run here
 			}
 		}
@@ -1303,6 +1309,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				}
 			} catch (SQLException e) {
 				Task.forceThrow(e);
+				//noinspection UnreachableCode
 				return -1; // never run here
 			}
 		}
@@ -1320,7 +1327,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				try (var cmd = connection.prepareStatement(sql)) {
 					var index = 1;
 					if (exclusiveStartKey != null)
-						cmd.setBytes(index++, copyIf(exclusiveStartKey));
+						cmd.setBytes(index++, exclusiveStartKey.CopyIf());
 					cmd.setInt(index, proposeLimit);
 					byte[] lastKey = null;
 					try (var rs = cmd.executeQuery()) {
@@ -1351,7 +1358,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				try (var cmd = connection.prepareStatement(sql)) {
 					var index = 1;
 					if (exclusiveStartKey != null)
-						cmd.setBytes(index++, copyIf(exclusiveStartKey));
+						cmd.setBytes(index++, exclusiveStartKey.CopyIf());
 					cmd.setInt(index, proposeLimit);
 					byte[] lastKey = null;
 					try (var rs = cmd.executeQuery()) {
@@ -1383,7 +1390,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				try (var cmd = connection.prepareStatement(sql)) {
 					var index = 1;
 					if (exclusiveStartKey != null)
-						cmd.setBytes(index++, copyIf(exclusiveStartKey));
+						cmd.setBytes(index++, exclusiveStartKey.CopyIf());
 					cmd.setInt(index, proposeLimit);
 					byte[] lastKey = null;
 					try (var rs = cmd.executeQuery()) {
@@ -1415,7 +1422,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 				try (var cmd = connection.prepareStatement(sql)) {
 					var index = 1;
 					if (exclusiveStartKey != null)
-						cmd.setBytes(index++, copyIf(exclusiveStartKey));
+						cmd.setBytes(index++, exclusiveStartKey.CopyIf());
 					cmd.setInt(index, proposeLimit);
 					byte[] lastKey = null;
 					try (var rs = cmd.executeQuery()) {
@@ -1463,6 +1470,7 @@ public final class DatabaseMySql extends DatabaseJdbc {
 			}
 		} catch (SQLException e) {
 			Task.forceThrow(e);
+			//noinspection UnreachableCode
 			return -1; // never run here
 		} finally {
 			if (PerfCounter.ENABLE_PERF)

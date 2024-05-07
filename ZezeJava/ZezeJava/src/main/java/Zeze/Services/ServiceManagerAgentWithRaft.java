@@ -1,38 +1,40 @@
 package Zeze.Services;
 
-import java.util.concurrent.ExecutionException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import Zeze.Builtin.ServiceManagerWithRaft.AllocateId;
-import Zeze.Builtin.ServiceManagerWithRaft.CommitServiceList;
 import Zeze.Builtin.ServiceManagerWithRaft.KeepAlive;
 import Zeze.Builtin.ServiceManagerWithRaft.Login;
 import Zeze.Builtin.ServiceManagerWithRaft.NormalClose;
-import Zeze.Builtin.ServiceManagerWithRaft.NotifyServiceList;
 import Zeze.Builtin.ServiceManagerWithRaft.OfflineNotify;
 import Zeze.Builtin.ServiceManagerWithRaft.OfflineRegister;
-import Zeze.Builtin.ServiceManagerWithRaft.ReadyServiceList;
-import Zeze.Builtin.ServiceManagerWithRaft.Register;
 import Zeze.Builtin.ServiceManagerWithRaft.SetServerLoad;
 import Zeze.Builtin.ServiceManagerWithRaft.Subscribe;
-import Zeze.Builtin.ServiceManagerWithRaft.SubscribeFirstCommit;
-import Zeze.Builtin.ServiceManagerWithRaft.UnRegister;
 import Zeze.Builtin.ServiceManagerWithRaft.UnSubscribe;
-import Zeze.Builtin.ServiceManagerWithRaft.Update;
+import Zeze.Builtin.ServiceManagerWithRaft.Edit;
 import Zeze.Component.Threading;
 import Zeze.Config;
+import Zeze.Net.ProtocolHandle;
+import Zeze.Net.Rpc;
 import Zeze.Raft.Agent;
 import Zeze.Raft.RaftConfig;
 import Zeze.Services.ServiceManager.AutoKey;
+import Zeze.Services.ServiceManager.BAllocateIdArgument;
+import Zeze.Services.ServiceManager.BAllocateIdResult;
+import Zeze.Services.ServiceManager.BEditService;
 import Zeze.Services.ServiceManager.BOfflineNotify;
 import Zeze.Services.ServiceManager.BServerLoad;
-import Zeze.Services.ServiceManager.BServiceInfo;
+import Zeze.Services.ServiceManager.BSubscribeArgument;
 import Zeze.Services.ServiceManager.BSubscribeInfo;
+import Zeze.Services.ServiceManager.BUnSubscribeArgument;
 import Zeze.Transaction.Procedure;
 import Zeze.Util.Action1;
-import Zeze.Util.OutObject;
 import Zeze.Util.Task;
 import Zeze.Util.TaskCompletionSource;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jetbrains.annotations.NotNull;
 
 public class ServiceManagerAgentWithRaft extends AbstractServiceManagerAgentWithRaft {
 	static final Logger logger = LogManager.getLogger(ServiceManagerAgentWithRaft.class);
@@ -43,7 +45,7 @@ public class ServiceManagerAgentWithRaft extends AbstractServiceManagerAgentWith
 		throw new UnsupportedOperationException();
 	}
 
-	public ServiceManagerAgentWithRaft(Config config) throws Exception {
+	public ServiceManagerAgentWithRaft(@NotNull Config config) throws Exception {
 		super.config = config;
 
 		var raftConf = RaftConfig.load(config.getServiceManagerConf().getRaftXml());
@@ -76,36 +78,14 @@ public class ServiceManagerAgentWithRaft extends AbstractServiceManagerAgentWith
 				future.setResult(true);
 			}
 			return 0;
-		}, true);
+		});
 	}
 
 	////////////////////////////////////////////////////////////////////////
 	@Override
-	protected long ProcessCommitServiceListRequest(CommitServiceList r) throws Exception {
-		var state = subscribeStates.get(r.Argument.serviceName);
-		if (state != null)
-			state.onCommit(r.Argument);
-		else
-			logger.warn("CommitServiceList But SubscribeState Not Found.");
-		r.SendResult();
-		return Procedure.Success;
-	}
-
-	@Override
 	protected long ProcessKeepAliveRequest(KeepAlive r) throws Exception {
 		if (onKeepAlive != null)
 			Task.getCriticalThreadPool().execute(onKeepAlive);
-		r.SendResult();
-		return Procedure.Success;
-	}
-
-	@Override
-	protected long ProcessNotifyServiceListRequest(NotifyServiceList r) throws Exception {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state != null)
-			state.onNotify(r.Argument);
-		else
-			logger.warn("NotifyServiceList But SubscribeState Not Found.");
 		r.SendResult();
 		return Procedure.Success;
 	}
@@ -125,12 +105,33 @@ public class ServiceManagerAgentWithRaft extends AbstractServiceManagerAgentWith
 	}
 
 	@Override
-	protected long ProcessRegisterRequest(Register r) throws Exception {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state == null)
-			return errorCode(Update.ServiceNotSubscribe);
-		state.onRegister(r.Argument);
+	protected long ProcessEditRequest(Edit r) {
+		for (var it = r.Argument.getRemove().iterator(); it.hasNext(); /**/) {
+			var unReg = it.next();
+			var state = subscribeStates.get(unReg.getServiceName());
+			if (null == state || !state.onUnRegister(unReg))
+				it.remove();
+		}
+
+		// 触发回调前修正集合之间的关系。
+		// 删除后来又加入的。
+		r.Argument.getRemove().removeIf(r.Argument.getAdd()::contains);
+
+		for (var reg : r.Argument.getAdd()) {
+			var state = subscribeStates.get(reg.getServiceName());
+			if (null == state)
+				continue; // 忽略本地没有订阅的。最好加个日志。
+			var oldNotSame = state.onRegister(reg);
+			if (null != oldNotSame)
+				r.Argument.getRemove().add(oldNotSame);
+		}
+
 		r.SendResult();
+		try {
+			triggerOnChanged(r.Argument);
+		} catch (Throwable e) { // logger.error
+			logger.error("ProcessEditRequest: triggerOnChanged exception:", e);
+		}
 		return 0;
 	}
 
@@ -151,40 +152,21 @@ public class ServiceManagerAgentWithRaft extends AbstractServiceManagerAgentWith
 	}
 
 	@Override
-	protected long ProcessSubscribeFirstCommitRequest(SubscribeFirstCommit r) throws Exception {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state != null)
-			state.onFirstCommit(r.Argument);
-		r.SendResult();
-		return Procedure.Success;
-	}
-
-	@Override
-	protected long ProcessUnRegisterRequest(UnRegister r) throws Exception {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state == null)
-			return Update.ServiceNotSubscribe;
-		state.onUnRegister(r.Argument);
-		r.SendResult();
-		return 0;
-	}
-
-	@Override
-	protected long ProcessUpdateRequest(Update r) throws Exception {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state == null)
-			return Update.ServiceNotSubscribe;
-		state.onUpdate(r.Argument);
-		r.SendResult();
-		return 0;
-	}
-
-	@Override
-	protected boolean sendReadyList(String serviceName, long serialId) {
-		var r = new ReadyServiceList();
-		r.Argument.serviceName = serviceName;
-		r.Argument.serialId = serialId;
-		raftClient.send(r, p -> 0);
+	protected boolean allocateAsync(String globalName, int allocCount,
+									ProtocolHandle<Rpc<BAllocateIdArgument, BAllocateIdResult>> callback) {
+		if (allocCount < 1)
+			throw new IllegalArgumentException();
+		var r = new AllocateId();
+		r.Argument.setName(globalName);
+		r.Argument.setCount(allocCount);
+		raftClient.send(r, (p) -> {
+			try {
+				return callback.handle(r);
+			} catch (Exception ex) {
+				Task.forceThrow(ex);
+			}
+			return 0;
+		});
 		return true;
 	}
 
@@ -205,104 +187,97 @@ public class ServiceManagerAgentWithRaft extends AbstractServiceManagerAgentWith
 	private void waitLoginReady() {
 		var volatileTmp = loginFuture;
 		if (volatileTmp.isDone()) {
-			try {
-				if (volatileTmp.get())
-					return;
-			} catch (InterruptedException | ExecutionException e) {
-				Task.forceThrow(e);
-			}
+			if (volatileTmp.get())
+				return;
 			throw new IllegalStateException("login fail.");
 		}
 		if (!volatileTmp.await(super.config.getServiceManagerConf().getLoginTimeout()))
 			throw new IllegalStateException("login timeout.");
 		// 再次查看结果。
-		try {
-			if (volatileTmp.isDone() && volatileTmp.get())
-				return;
-		} catch (InterruptedException | ExecutionException e) {
-			Task.forceThrow(e);
-		}
+		if (volatileTmp.isDone() && volatileTmp.get())
+			return;
 		// 只等待一次，不成功则失败。
 		throw new IllegalStateException("login timeout.");
 	}
 
-	private synchronized TaskCompletionSource<Boolean> startNewLogin() {
-		loginFuture.cancel(true); // 如果旧的Future上面有人在等，让他们失败。
-		return loginFuture = new TaskCompletionSource<>();
+	private TaskCompletionSource<Boolean> startNewLogin() {
+		lock();
+		try {
+			loginFuture.cancel(true); // 如果旧的Future上面有人在等，让他们失败。
+			return loginFuture = new TaskCompletionSource<>();
+		} finally {
+			unlock();
+		}
 	}
 
 	@Override
-	public BServiceInfo registerService(BServiceInfo info) {
-		verify(info.getServiceIdentity());
+	public void editService(@NotNull BEditService arg) {
+		for (var info : arg.getAdd())
+			verify(info.getServiceIdentity());
 		waitLoginReady();
-		raftClient.sendForWait(new Register(info)).await();
-		logger.debug("RegisterService {}", info);
-		return info;
+
+		var edit = new Edit(arg);
+		raftClient.sendForWait(edit).await();
+		logger.debug("EditService {}", arg);
 	}
 
 	@Override
-	public BServiceInfo updateService(BServiceInfo info) {
+	public @NotNull SubscribeState subscribeService(@NotNull BSubscribeInfo info) {
 		waitLoginReady();
-		raftClient.sendForWait(new Update(info)).await();
-		return info;
+		return super.subscribeService(info);
 	}
 
 	@Override
-	public void unRegisterService(BServiceInfo info) {
+	public CompletableFuture<List<SubscribeState>> subscribeServicesAsync(@NotNull BSubscribeArgument arg) {
 		waitLoginReady();
-		raftClient.sendForWait(new UnRegister(info)).await();
-	}
-
-	@Override
-	public SubscribeState subscribeService(BSubscribeInfo info) {
-		waitLoginReady();
-
-		final var newAdd = new OutObject<Boolean>();
-		newAdd.value = false;
-		var subState = subscribeStates.computeIfAbsent(info.getServiceName(), __ -> {
-			newAdd.value = true;
-			return new SubscribeState(info);
+		logger.debug("subscribeServicesAsync: {}", arg);
+		var cf = new CompletableFuture<List<SubscribeState>>();
+		var r = new Subscribe(arg);
+		raftClient.send(r, __ -> {
+			var rc = r.getResultCode();
+			if (rc == 0) {
+				var edits = new BEditService();
+				var states = new ArrayList<SubscribeState>(r.Argument.subs.size());
+				for (var info : r.Argument.subs) {
+					var state = subscribeStates.computeIfAbsent(info.getServiceName(), ___ -> new SubscribeState(info));
+					states.add(state);
+					var result = r.Result.map.get(info.getServiceName());
+					if (result != null)
+						state.onFirstCommit(result, edits);
+				}
+				try {
+					triggerOnChanged(edits);
+				} catch (Throwable e) { // logger.error
+					logger.error("subscribeServicesAsync: triggerOnChanged exception:", e);
+				}
+				cf.complete(states);
+			} else {
+				logger.error("subscribeServicesAsync: resultCode={}", rc);
+				cf.completeExceptionally(new IllegalStateException("Subscribe resultCode=" + rc));
+			}
+			return 0;
 		});
-
-		if (newAdd.value) {
-			try {
-				raftClient.sendForWait(new Subscribe(info)).await();
-				logger.debug("SubscribeService {}", info);
-			} catch (Throwable ex) { // rethrow
-				// 【警告】这里没有原子化执行请求和处理结果。
-				// 由于上面是computeIfAbsent，仅第一个请求会发送，不会并发发送相同的订阅，所以，
-				// 可以在这里rollback处理一下。
-				subscribeStates.remove(info.getServiceName()); // rollback
-				throw ex;
-			}
-		}
-		return subState;
+		return cf;
 	}
 
 	@Override
-	public void unSubscribeService(String serviceName) {
+	public void unSubscribeService(@NotNull BUnSubscribeArgument arg) {
 		waitLoginReady();
-
-		var state = subscribeStates.remove(serviceName);
-		if (state != null) {
-			try {
-				raftClient.sendForWait(new UnSubscribe(state.subscribeInfo)).await();
-				logger.debug("UnSubscribeService {}", state.subscribeInfo);
-			} catch (Throwable e) { // rethrow
-				subscribeStates.putIfAbsent(serviceName, state); // rollback
-				throw e;
-			}
-		}
+		logger.debug("UnSubscribeService {}", arg);
+		var r = new UnSubscribe(arg);
+		raftClient.sendForWait(r).await();
+		for (var serviceName : arg.serviceNames)
+			subscribeStates.remove(serviceName);
 	}
 
 	@Override
-	public boolean setServerLoad(BServerLoad load) {
+	public boolean setServerLoad(@NotNull BServerLoad load) {
 		raftClient.send(new SetServerLoad(load), p -> 0);
 		return true;
 	}
 
 	@Override
-	public void offlineRegister(BOfflineNotify argument, Action1<BOfflineNotify> handle) {
+	public void offlineRegister(@NotNull BOfflineNotify argument, @NotNull Action1<BOfflineNotify> handle) {
 		waitLoginReady();
 		onOfflineNotifies.putIfAbsent(argument.notifyId, handle);
 		raftClient.sendForWait(new OfflineRegister(argument)).await();

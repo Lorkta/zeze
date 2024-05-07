@@ -11,6 +11,11 @@ public abstract class AbstractZoker implements Zeze.IModule {
     @Override public String getFullName() { return ModuleFullName; }
     @Override public boolean isBuiltin() { return true; }
 
+    private transient final java.util.concurrent.locks.ReentrantLock __thisLock = new java.util.concurrent.locks.ReentrantLock();
+    @Override public void lock() { __thisLock.lock(); }
+    @Override public void unlock() { __thisLock.unlock(); }
+    @Override public java.util.concurrent.locks.Lock getLock() { return __thisLock; }
+
     public static final int eDuplicateZoker = 1; // Zoker名字重复了
     public static final int eOpenError = 1; // 打开文件发生了系统错误
     public static final int eAppendOffset = 2; // 添加数据时，Offset越界了（超出结尾）

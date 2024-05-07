@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.xml.parsers.DocumentBuilderFactory;
+import Zeze.Arch.Gen.GenModule;
 import Zeze.Net.ServiceConf;
 import Zeze.Transaction.CheckpointFlushMode;
 import Zeze.Transaction.CheckpointMode;
@@ -28,7 +29,8 @@ import org.w3c.dom.NodeList;
 
 public final class Config {
 	public interface ICustomize {
-		@NotNull String getName();
+		@NotNull
+		String getName();
 
 		void parse(@NotNull Element self);
 	}
@@ -41,6 +43,7 @@ public final class Config {
 		RocksDb,
 		DynamoDb,
 		Dbh2,
+		Redis,
 	}
 
 	private @NotNull String name = "";
@@ -99,12 +102,25 @@ public final class Config {
 
 	private long procedureStatisticsReportPeriod = 60000;
 	private long tableStatisticsReportPeriod = 60000;
-	private String hotWorkingDir = "";
-	private String hotDistributeDir = "distributes";
+	private @NotNull String hotWorkingDir = "";
+	private @NotNull String hotDistributeDir = "distributes";
 	private int deadLockBreakerPeriod = 60000;
 
 	private int procedureLockWatcherMin = 25;
 	private long appVersion;
+	private @NotNull String history = "";
+
+	public boolean isHistory() {
+		return !history.isEmpty();
+	}
+
+	public @NotNull String getHistory() {
+		return history;
+	}
+
+	public void setHistory(@Nullable String history) {
+		this.history = history != null ? history : "";
+	}
 
 	public int getProcedureLockWatcherMin() {
 		return procedureLockWatcherMin;
@@ -114,20 +130,20 @@ public final class Config {
 		this.procedureLockWatcherMin = procedureLockWatcherMin;
 	}
 
-	public String getHotWorkingDir() {
+	public @NotNull String getHotWorkingDir() {
 		return hotWorkingDir;
 	}
 
-	public String getHotDistributeDir() {
+	public @NotNull String getHotDistributeDir() {
 		return hotDistributeDir;
 	}
 
-	public void setHotWorkingDir(String value) {
-		hotWorkingDir = value;
+	public void setHotWorkingDir(@Nullable String value) {
+		hotWorkingDir = value != null ? value : "";
 	}
 
-	public void setHotDistributeDir(String value) {
-		hotDistributeDir = value;
+	public void setHotDistributeDir(@Nullable String value) {
+		hotDistributeDir = value != null ? value : "";
 	}
 
 	public int getDeadLockBreakerPeriod() {
@@ -387,7 +403,7 @@ public final class Config {
 	}
 
 	public static Database createDatabase(@NotNull Application zeze, @NotNull DatabaseConf conf) throws Exception {
-		switch (conf.databaseType) {
+		switch (GenModule.instance.genFileSrcRoot == null ? conf.databaseType : DbType.Memory) {
 		case Memory:
 			return new DatabaseMemory(zeze, conf);
 		case MySql:
@@ -402,6 +418,8 @@ public final class Config {
 			return new DatabaseRocksDb(zeze, conf);
 		case Dbh2:
 			return new Zeze.Dbh2.Database(zeze, zeze.tryNewDbh2AgentManager(), conf);
+		case Redis:
+			return new Zeze.Transaction.DatabaseRedis(zeze, conf);
 		default:
 			throw new UnsupportedOperationException("unknown database type.");
 		}
@@ -631,6 +649,8 @@ public final class Config {
 		if (!attr.isBlank())
 			appVersion = Str.parseVersion(attr);
 
+		history = self.getAttribute("History").trim();
+
 		NodeList childNodes = self.getChildNodes();
 		for (int i = 0; i < childNodes.getLength(); i++) {
 			Node node = childNodes.item(i);
@@ -844,8 +864,7 @@ public final class Config {
 			return name;
 		}
 
-		public void setName(@NotNull String name) {
-			//noinspection ConstantValue
+		public void setName(@Nullable String name) {
 			this.name = name != null ? name : "";
 		}
 
@@ -862,8 +881,7 @@ public final class Config {
 			return databaseUrl;
 		}
 
-		public void setDatabaseUrl(@NotNull String databaseUrl) {
-			//noinspection ConstantValue
+		public void setDatabaseUrl(@Nullable String databaseUrl) {
 			this.databaseUrl = databaseUrl != null ? databaseUrl : "";
 		}
 
@@ -932,6 +950,9 @@ public final class Config {
 				break;
 			case "Dbh2":
 				databaseType = DbType.Dbh2;
+				break;
+			case "Redis":
+				databaseType = DbType.Redis;
 				break;
 			default:
 				throw new UnsupportedOperationException("unknown database type.");

@@ -12,6 +12,7 @@ import java.util.Collection;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 import Zeze.Application;
@@ -28,6 +29,7 @@ import Zeze.Util.LongConcurrentHashMap;
 import Zeze.Util.LongHashMap;
 import Zeze.Util.OutLong;
 import Zeze.Util.OutObject;
+import Zeze.Util.PerfCounter;
 import Zeze.Util.Random;
 import Zeze.Util.Task;
 import org.apache.logging.log4j.LogManager;
@@ -35,7 +37,7 @@ import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-public class Service {
+public class Service extends ReentrantLock {
 	protected static final Logger logger = LogManager.getLogger(Service.class);
 	private static final AtomicLong staticSessionIdAtomicLong = new AtomicLong(1);
 	private static final @NotNull VarHandle closedRecvCountHandle, closedRecvSizeHandle;
@@ -62,6 +64,7 @@ public class Service {
 	}
 
 	private final @NotNull String name;
+	private @NotNull String instanceName = ""; // 用来区分多实例的Service，用于日志，不影响逻辑。
 	private final Application zeze;
 	private @NotNull SocketOptions socketOptions; // 同一个 Service 下的所有连接都是用相同配置。
 	private @NotNull ServiceConf config;
@@ -82,6 +85,14 @@ public class Service {
 	private @Nullable ScheduledFuture<?> statisticLogFuture;
 	private boolean noProcedure = false;
 	protected Future<?> keepCheckTimer;
+
+	public @NotNull String getInstanceName() {
+		return instanceName;
+	}
+
+	public void setInstanceName(@NotNull String instanceName) {
+		this.instanceName = instanceName;
+	}
 
 	public Service(@NotNull String name) {
 		this(name, (Config)null);
@@ -256,20 +267,25 @@ public class Service {
 		stop();
 	}
 
-	public synchronized void stop() throws Exception {
-		config.stop();
+	public void stop() throws Exception {
+		lock();
+		try {
+			config.stop();
 
-		for (AsyncSocket as : socketMap)
-			as.close(serviceStoppedException); // remove in callback OnSocketClose
+			for (AsyncSocket as : socketMap)
+				as.close(serviceStoppedException); // remove in callback OnSocketClose
 
-		// 先不清除，让Rpc的TimerTask仍然在超时以后触发回调。
-		// 【考虑一下】也许在服务停止时马上触发回调并且清除上下文比较好。
-		// 【注意】直接清除会导致同步等待的操作无法继续。异步只会没有回调，没问题。
-		// _RpcContexts.Clear();
+			// 先不清除，让Rpc的TimerTask仍然在超时以后触发回调。
+			// 【考虑一下】也许在服务停止时马上触发回调并且清除上下文比较好。
+			// 【注意】直接清除会导致同步等待的操作无法继续。异步只会没有回调，没问题。
+			// _RpcContexts.Clear();
 
-		if (keepCheckTimer != null) {
-			keepCheckTimer.cancel(true);
-			keepCheckTimer = null;
+			if (keepCheckTimer != null) {
+				keepCheckTimer.cancel(true);
+				keepCheckTimer = null;
+			}
+		} finally {
+			unlock();
 		}
 	}
 
@@ -481,9 +497,10 @@ public class Service {
 		// 但为了更具适应性，就是有人重载了下面的dispatchProtocol，然后没有处理事务，直接派发到这里，
 		// 这里还是处理了存储过程的创建。但这里处理的存储过程没有redo时重置协议参数的能力。
 		if (!noProcedure && factoryHandle.Level != TransactionLevel.None && (zeze = this.zeze) != null) {
-			Task.executeUnsafe(zeze.newProcedure(() -> p.handle(this, factoryHandle), p.getClass().getName(),
-							factoryHandle.Level, null != p.getSender() ? p.getSender().getUserState() : null),
-					p, Protocol::trySendResultCode, factoryHandle.Mode);
+			var protocolClassName = p.getClass().getName();
+			var proc = zeze.newProcedure(() -> p.handle(this, factoryHandle), protocolClassName,
+					factoryHandle.Level, null != p.getSender() ? p.getSender().getUserState() : null);
+			Task.executeUnsafe(proc, p, Protocol::trySendResultCode, factoryHandle.Mode);
 		} else {
 			Task.executeUnsafe(() -> p.handle(this, factoryHandle),
 					p, Protocol::trySendResultCode, null, factoryHandle.Mode);
@@ -502,16 +519,20 @@ public class Service {
 		if (!noProcedure && factoryHandle.Level != TransactionLevel.None && (zeze = this.zeze) != null) {
 			// 事务模式，需要从decode重启。
 			// 传给事务的buffer可能重做需要重新decode，不能直接引用网络层的buffer，需要copy一次。
-			var bbCopy = ByteBuffer.Wrap(bb.Copy());
+			var protocolRawArgument = new Binary(bb.Copy());
+			var bbCopy = ByteBuffer.Wrap(protocolRawArgument);
 			var outProtocol = new OutObject<Protocol<?>>();
-			Task.executeUnsafe(zeze.newProcedure(() -> {
-						var needLog = bbCopy.ReadIndex == 0;
-						bbCopy.ReadIndex = 0; // 考虑redo,要重置读指针
-						var p = decodeProtocol(typeId, bbCopy, factoryHandle, so, needLog);
-						outProtocol.value = p;
-						return p.handle(this, factoryHandle);
-					}, factoryHandle.Class.getName(), factoryHandle.Level, so != null ? so.getUserState() : null),
-					outProtocol, Protocol::trySendResultCode, factoryHandle.Mode);
+			var protocolClassName = factoryHandle.Class.getName();
+			var proc = zeze.newProcedure(() -> {
+				var needLog = bbCopy.ReadIndex == 0;
+				bbCopy.ReadIndex = 0; // 考虑redo,要重置读指针
+				var p = decodeProtocol(typeId, bbCopy, factoryHandle, so, needLog);
+				outProtocol.value = p;
+				return p.handle(this, factoryHandle);
+			}, protocolClassName, factoryHandle.Level, so != null ? so.getUserState() : null);
+			proc.setProtocolClassName(protocolClassName);
+			proc.setProtocolRawArgument(protocolRawArgument);
+			Task.executeUnsafe(proc, outProtocol, Protocol::trySendResultCode, factoryHandle.Mode);
 		} else {
 			var p = decodeProtocol(typeId, bb, factoryHandle, so);
 			// 其他协议或者rpc，马上在io线程继续派发。
@@ -793,55 +814,66 @@ public class Service {
 		return false;
 	}
 
-	public synchronized @NotNull ScheduledFuture<?> startStatisticLog(int periodSec) {
-		var f = statisticLogFuture;
-		if (f != null && !f.isCancelled())
+	public @NotNull ScheduledFuture<?> startStatisticLog(int periodSec) {
+		lock();
+		try {
+			var f = statisticLogFuture;
+			if (f != null && !f.isCancelled())
+				return f;
+			var lastSizes = new long[6];
+			lastSizes[0] = -1;
+			f = Task.scheduleUnsafe(Random.getInstance().nextLong(periodSec * 1000L), periodSec * 1000L, () -> {
+				updateRecvSendSize();
+				var selectors = getSelectors();
+				long selectCount = selectors.getSelectCount();
+				long recvCount = this.recvCount;
+				long recvSize = this.recvSize;
+				long sendCount = this.sendCount;
+				long sendSize = this.sendSize;
+				long sendRawSize = this.sendRawSize;
+				if (lastSizes[0] != -1) {
+					long sn = (selectCount - lastSizes[0]) / periodSec;
+					long rc = (recvCount - lastSizes[1]) / periodSec;
+					long rs = (recvSize - lastSizes[2]) / periodSec;
+					long sc = (sendCount - lastSizes[3]) / periodSec;
+					long ss = (sendSize - lastSizes[4]) / periodSec;
+					long sr = (sendRawSize - lastSizes[5]) / periodSec;
+					var operates = new OutLong();
+					var outBufSize = new OutLong();
+					foreach(socket -> {
+						operates.value += socket.getOperateSize();
+						outBufSize.value += socket.getOutputBufferSize();
+					});
+					operates.value /= periodSec;
+					outBufSize.value /= periodSec;
+					PerfCounter.logger.info(
+							"{}.{}.stat: select={}/{}, recv={}/{}, send={}/{}, sendRaw={}, sockets={}, ops={}, outBuf={}",
+							name, instanceName, sn, selectors.getCount(), rs, rc, ss, sc, sr, getSocketCount(),
+							operates.value, outBufSize.value);
+				}
+				lastSizes[0] = selectCount;
+				lastSizes[1] = recvCount;
+				lastSizes[2] = recvSize;
+				lastSizes[3] = sendCount;
+				lastSizes[4] = sendSize;
+				lastSizes[5] = sendRawSize;
+			});
+			statisticLogFuture = f;
 			return f;
-		var lastSizes = new long[6];
-		lastSizes[0] = -1;
-		f = Task.scheduleUnsafe(Random.getInstance().nextLong(periodSec * 1000L), periodSec * 1000L, () -> {
-			updateRecvSendSize();
-			var selectors = getSelectors();
-			long selectCount = selectors.getSelectCount();
-			long recvCount = this.recvCount;
-			long recvSize = this.recvSize;
-			long sendCount = this.sendCount;
-			long sendSize = this.sendSize;
-			long sendRawSize = this.sendRawSize;
-			if (lastSizes[0] != -1) {
-				long sn = (selectCount - lastSizes[0]) / periodSec;
-				long rc = (recvCount - lastSizes[1]) / periodSec;
-				long rs = (recvSize - lastSizes[2]) / periodSec;
-				long sc = (sendCount - lastSizes[3]) / periodSec;
-				long ss = (sendSize - lastSizes[4]) / periodSec;
-				long sr = (sendRawSize - lastSizes[5]) / periodSec;
-				var operates = new OutLong();
-				var outBufSize = new OutLong();
-				foreach(socket -> {
-					operates.value += socket.getOperateSize();
-					outBufSize.value += socket.getOutputBufferSize();
-				});
-				operates.value /= periodSec;
-				outBufSize.value /= periodSec;
-				logger.info("{}.stat: select={}/{}, recv={}/{}, send={}/{}, sendRaw={}, sockets={}, ops={}, outBuf={}",
-						getClass().getName(), sn, selectors.getCount(), rs, rc, ss, sc, sr, getSocketCount(),
-						operates.value, outBufSize.value);
-			}
-			lastSizes[0] = selectCount;
-			lastSizes[1] = recvCount;
-			lastSizes[2] = recvSize;
-			lastSizes[3] = sendCount;
-			lastSizes[4] = sendSize;
-			lastSizes[5] = sendRawSize;
-		});
-		statisticLogFuture = f;
-		return f;
+		} finally {
+			unlock();
+		}
 	}
 
-	public synchronized boolean cancelStartStatisticLog() {
-		var f = statisticLogFuture;
-		statisticLogFuture = null;
-		return f != null && f.cancel(false);
+	public boolean cancelStartStatisticLog() {
+		lock();
+		try {
+			var f = statisticLogFuture;
+			statisticLogFuture = null;
+			return f != null && f.cancel(false);
+		} finally {
+			unlock();
+		}
 	}
 
 	@SuppressWarnings("MethodMayBeStatic")
@@ -849,13 +881,18 @@ public class Service {
 		logger.warn("rpc response: lost context, maybe timeout. {}", rpc);
 	}
 
-	public synchronized void tryStartKeepAliveCheckTimer() {
-		if (keepCheckTimer == null) {
-			var period = getConfig().getHandshakeOptions().getKeepCheckPeriod() * 1000L;
-			if (period > 0) {
-				keepCheckTimer = Task.scheduleUnsafe(
-						Random.getInstance().nextLong(period) + 1, period, this::checkKeepAlive);
+	public void tryStartKeepAliveCheckTimer() {
+		lock();
+		try {
+			if (keepCheckTimer == null) {
+				var period = getConfig().getHandshakeOptions().getKeepCheckPeriod() * 1000L;
+				if (period > 0) {
+					keepCheckTimer = Task.scheduleUnsafe(
+							Random.getInstance().nextLong(period) + 1, period, this::checkKeepAlive);
+				}
 			}
+		} finally {
+			unlock();
 		}
 	}
 

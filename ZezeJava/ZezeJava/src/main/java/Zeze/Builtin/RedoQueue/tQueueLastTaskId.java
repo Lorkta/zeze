@@ -16,6 +16,16 @@ public final class tQueueLastTaskId extends TableX<String, Zeze.Builtin.RedoQueu
         super(-1495051256, "Zeze_Builtin_RedoQueue_tQueueLastTaskId", suffix);
     }
 
+    @Override
+    public Class<String> getKeyClass() {
+        return String.class;
+    }
+
+    @Override
+    public Class<Zeze.Builtin.RedoQueue.BTaskId> getValueClass() {
+        return Zeze.Builtin.RedoQueue.BTaskId.class;
+    }
+
     public static final int VAR_TaskId = 1;
 
     @Override

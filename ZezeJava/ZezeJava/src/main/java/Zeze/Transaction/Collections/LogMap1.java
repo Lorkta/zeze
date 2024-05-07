@@ -4,8 +4,11 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.LongFunction;
+import java.util.function.ToLongFunction;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Serialize.IByteBuffer;
+import Zeze.Transaction.Bean;
 import Zeze.Transaction.Log;
 import Zeze.Transaction.Savepoint;
 import org.jetbrains.annotations.NotNull;
@@ -17,9 +20,14 @@ public class LogMap1<K, V> extends LogMap<K, V> {
 	private final HashMap<K, V> replaced = new HashMap<>();
 	private final Set<K> removed = new HashSet<>();
 
-	LogMap1(@NotNull Meta2<K, V> meta, @NotNull org.pcollections.PMap<K, V> value) {
+	public LogMap1(@NotNull Meta2<K, V> meta, @NotNull org.pcollections.PMap<K, V> value) {
 		super(value);
 		this.meta = meta;
+	}
+
+	public LogMap1(@NotNull Class<K> keyClass, Class<V> valueClass) {
+		super(Empty.map()); // not used
+		this.meta = Meta2.getMap1Meta(keyClass, valueClass);
 	}
 
 	@Override
@@ -96,7 +104,6 @@ public class LogMap1<K, V> extends LogMap<K, V> {
 		var valueEncoder = meta.valueEncoder;
 		for (var p : replaced.entrySet()) {
 			keyEncoder.accept(bb, p.getKey());
-			//noinspection DataFlowIssue
 			valueEncoder.accept(bb, p.getValue());
 		}
 
@@ -112,7 +119,6 @@ public class LogMap1<K, V> extends LogMap<K, V> {
 		var valueDecoder = meta.valueDecoder;
 		for (int i = bb.ReadUInt(); i > 0; --i) {
 			var key = keyDecoder.apply(bb);
-			//noinspection DataFlowIssue
 			var value = valueDecoder.apply(bb);
 			replaced.put(key, value);
 		}

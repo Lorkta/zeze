@@ -8,6 +8,7 @@ import org.apache.logging.log4j.Logger;
 public final class ShutdownHook {
 	private static final Logger logger = LogManager.getLogger(ShutdownHook.class);
 	private static final LinkedHashMap<Object, Action0> shutdownActions = new LinkedHashMap<>();
+	private static final FastLock shutdownActionsLock = new FastLock();
 
 	static {
 		Runtime.getRuntime().addShutdownHook(new Thread("ShutdownHook") {
@@ -16,8 +17,11 @@ public final class ShutdownHook {
 			public void run() {
 				logger.info("ShutdownHook begin");
 				Map.Entry<Object, Action0>[] entries;
-				synchronized (shutdownActions) {
+				shutdownActionsLock.lock();
+				try {
 					entries = shutdownActions.entrySet().toArray(new Map.Entry[shutdownActions.size()]);
+				} finally {
+					shutdownActionsLock.unlock();
 				}
 				for (int i = entries.length - 1; i >= 0; i--) { // 按add的逆序执行各action
 					var entry = entries[i];
@@ -42,14 +46,20 @@ public final class ShutdownHook {
 	}
 
 	public static void add(Object key, Action0 action) {
-		synchronized (shutdownActions) {
+		shutdownActionsLock.lock();
+		try {
 			shutdownActions.put(key, action);
+		} finally {
+			shutdownActionsLock.unlock();
 		}
 	}
 
 	public static Action0 remove(Object key) {
-		synchronized (shutdownActions) {
+		shutdownActionsLock.lock();
+		try {
 			return shutdownActions.remove(key);
+		} finally {
+			shutdownActionsLock.unlock();
 		}
 	}
 

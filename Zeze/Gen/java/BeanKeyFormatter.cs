@@ -41,7 +41,8 @@ namespace Zeze.Gen.java
                 string final = v.VariableType is BeanKey ? "final " : "";
                 sw.WriteLine($"    private {final}{TypeName.GetName(v.VariableType)} {v.NamePrivate};{v.Comment}");
             }
-            sw.WriteLine();
+            if (beanKey.Variables.Count > 0)
+                sw.WriteLine();
 
             Construct.Make(beanKey, sw, "    ");
             // params construct
@@ -79,7 +80,54 @@ namespace Zeze.Gen.java
             NegativeCheck.Make(beanKey, sw, "    ");
             DecodeResultSet.Make(beanKey, sw, "    ");
             EncodeSQLStatement.Make(beanKey, sw, "    ");
+            GenVariables(beanKey, sw, "    ");
             sw.WriteLine("}");
+        }
+
+        public void GenVariables(BeanKey bean, StreamWriter sw, string prefix)
+        {
+            if (bean.VariablesIdOrder.Count > 0)
+            {
+                sw.WriteLine();
+                sw.WriteLine($"{prefix}@Override");
+                sw.WriteLine($"{prefix}public java.util.ArrayList<Zeze.Builtin.HotDistribute.BVariable.Data> variables() {{");
+                sw.WriteLine($"{prefix}    var vars = new java.util.ArrayList<Zeze.Builtin.HotDistribute.BVariable.Data>();");
+                foreach (var v in bean.VariablesIdOrder)
+                {
+                    string type = v.Type;
+                    string key = v.Key;
+                    string value = v.Value;
+
+                    var vType = v.VariableType;
+                    if (vType.IsBean)
+                    {
+                        type = Variable.GetBeanFullName(vType);
+                    }
+                    else if (vType.IsCollection)
+                    {
+                        if (vType is TypeMap map)
+                        {
+                            if (map.KeyType.IsBean)
+                                key = Variable.GetBeanFullName(map.KeyType);
+                            if (map.ValueType.IsBean)
+                                value = Variable.GetBeanFullName(map.ValueType);
+                        }
+                        else if (vType is TypeList list)
+                        {
+                            if (list.ValueType.IsBean)
+                                value = Variable.GetBeanFullName(list.ValueType);
+                        }
+                        else if (vType is TypeSet set)
+                        {
+                            if (set.ValueType.IsBean)
+                                value = Variable.GetBeanFullName(set.ValueType);
+                        }
+                    }
+                    sw.WriteLine($"{prefix}    vars.add(new Zeze.Builtin.HotDistribute.BVariable.Data({v.Id}, \"{v.Name}\", \"{type}\", \"{key}\", \"{value}\"));");
+                }
+                sw.WriteLine($"{prefix}    return vars;");
+                sw.WriteLine($"{prefix}}}");
+            }
         }
     }
 }

@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import Zeze.Application;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Services.Daemon;
+import Zeze.Util.FastLock;
 import Zeze.Util.Reflect;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -177,6 +178,7 @@ public class AchillesHeelDaemon {
 		private final String fileName;
 		private final RandomAccessFile raf;
 		private final FileChannel channel;
+		private final FastLock channelLock = new FastLock();
 		private final MappedByteBuffer mmap;
 		private final long[] lastReportTime = new long[agents.length];
 		private volatile boolean running = true;
@@ -206,13 +208,16 @@ public class AchillesHeelDaemon {
 			bb.WriteLong8(value);
 
 			// 不同的GlobalAgent能并发起来。由于上面的低频率报告优化，这个不是很必要了。
-			synchronized (channel) {
+			channelLock.lock();
+			try {
 				try (var ignored = channel.lock()) {
 					mmap.position(agent.globalCacheManagerHashIndex * 8);
 					mmap.put(bb.Bytes, 0, 8);
 				} catch (Throwable ex) { // logger.error
 					logger.error("setActiveTime", ex);
 				}
+			} finally {
+				channelLock.unlock();
 			}
 		}
 

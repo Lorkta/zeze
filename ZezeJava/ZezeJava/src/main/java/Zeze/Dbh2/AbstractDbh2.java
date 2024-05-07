@@ -11,6 +11,11 @@ public abstract class AbstractDbh2 implements Zeze.IModule {
     @Override public String getFullName() { return ModuleFullName; }
     @Override public boolean isBuiltin() { return true; }
 
+    private transient final java.util.concurrent.locks.ReentrantLock __thisLock = new java.util.concurrent.locks.ReentrantLock();
+    @Override public void lock() { __thisLock.lock(); }
+    @Override public void unlock() { __thisLock.unlock(); }
+    @Override public java.util.concurrent.locks.Lock getLock() { return __thisLock; }
+
     public static final int eBucketNotFound = 1;
     public static final int eBucketMismatch = 2;
     public static final int eDuplicateTid = 3;

@@ -1,22 +1,28 @@
 package Zeze.Services.ServiceManager;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import Zeze.Component.Threading;
 import Zeze.Config;
 import Zeze.Net.Connector;
+import Zeze.Net.ProtocolHandle;
+import Zeze.Net.Rpc;
 import Zeze.Net.Service.ProtocolFactoryHandle;
 import Zeze.Transaction.DispatchMode;
 import Zeze.Transaction.Procedure;
 import Zeze.Transaction.TransactionLevel;
 import Zeze.Util.Action1;
-import Zeze.Util.OutObject;
 import Zeze.Util.Task;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import java.util.List;
 
 public final class Agent extends AbstractAgent {
-	static final Logger logger = LogManager.getLogger(Agent.class);
+	static final @NotNull Logger logger = LogManager.getLogger(Agent.class);
 
 	/**
 	 * 使用Config配置连接信息，可以配置是否支持重连。
@@ -24,7 +30,7 @@ public final class Agent extends AbstractAgent {
 	 */
 	public static final String defaultServiceName = "Zeze.Services.ServiceManager.Agent";
 
-	private final AgentClient client;
+	private final @NotNull AgentClient client;
 	private final ConcurrentHashMap<BServiceInfo, BServiceInfo> registers = new ConcurrentHashMap<>();
 
 	private Threading threading;
@@ -49,118 +55,97 @@ public final class Agent extends AbstractAgent {
 	}
 
 	@Override
-	public BServiceInfo updateService(BServiceInfo info) {
+	public void editService(@NotNull BEditService arg) {
+		for (var info : arg.getAdd())
+			verify(info.getServiceIdentity());
 		waitConnectorReady();
-		var reg = registers.get(info);
-		if (reg == null)
-			return null;
 
-		new Update(info).SendAndWaitCheckResultCode(client.getSocket());
+		var edit = new EditService(arg);
+		edit.SendAndWaitCheckResultCode(client.getSocket());
 
-		reg.setPassiveIp(info.getPassiveIp());
-		reg.setPassivePort(info.getPassivePort());
-		reg.setExtraInfo(info.getExtraInfo());
-		return reg;
+		// 成功以后更新本地信息。
+		for (var unReg : arg.getRemove())
+			registers.remove(unReg);
+
+		for (var reg : arg.getAdd())
+			registers.put(reg, reg);
 	}
 
 	@Override
-	public BServiceInfo registerService(BServiceInfo info) {
-		verify(info.getServiceIdentity());
+	public @NotNull CompletableFuture<List<SubscribeState>> subscribeServicesAsync(@NotNull BSubscribeArgument infos) {
 		waitConnectorReady();
-
-		var regNew = new OutObject<Boolean>();
-		regNew.value = false;
-		var regServInfo = registers.computeIfAbsent(info, key -> {
-			regNew.value = true;
-			return key;
-		});
-
-		if (regNew.value) {
-			try {
-				new Register(info).SendAndWaitCheckResultCode(client.getSocket());
-				logger.debug("RegisterService {}", info);
-			} catch (Throwable e) { // rethrow
-				// rollback.
-				registers.remove(info, info); // rollback
-				throw e;
+		logger.debug("subscribeServicesAsync: {}", infos);
+		var cf = new CompletableFuture<List<SubscribeState>>();
+		if (!new Subscribe(infos).Send(client.getSocket(), r -> {
+			var rc = r.getResultCode();
+			if (rc == 0) {
+				var edits = new BEditService();
+				var states = new ArrayList<SubscribeState>(r.Argument.subs.size());
+				for (var info : r.Argument.subs) {
+					var state = subscribeStates.computeIfAbsent(info.getServiceName(), __ -> new SubscribeState(info));
+					states.add(state);
+					var result = r.Result.map.get(info.getServiceName());
+					if (result != null)
+						state.onFirstCommit(result, edits);
+				}
+				try {
+					triggerOnChanged(edits);
+				} catch (Throwable e) { // logger.error
+					logger.error("subscribeServicesAsync: triggerOnChanged exception:", e);
+				}
+				cf.complete(states);
+			} else {
+				logger.error("subscribeServicesAsync: resultCode={}", rc);
+				cf.completeExceptionally(new IllegalStateException("Subscribe resultCode=" + rc));
 			}
+			return 0;
+		})) {
+			logger.error("subscribeServicesAsync: send Subscribe failed");
+			cf.completeExceptionally(new IllegalStateException("send Subscribe failed"));
 		}
-		return regServInfo;
+		return cf;
 	}
 
 	@Override
-	public void unRegisterService(BServiceInfo info) {
+	public @NotNull SubscribeState subscribeService(@NotNull BSubscribeInfo info) {
 		waitConnectorReady();
-
-		var exist = registers.remove(info);
-		if (exist != null) {
-			try {
-				new UnRegister(info).SendAndWaitCheckResultCode(client.getSocket());
-			} catch (Throwable e) { // rethrow
-				// rollback.
-				registers.putIfAbsent(exist, exist); // rollback
-				throw e;
-			}
-		}
+		return super.subscribeService(info);
 	}
 
 	@Override
-	public SubscribeState subscribeService(BSubscribeInfo info) {
+	public void unSubscribeService(@NotNull BUnSubscribeArgument arg) {
 		waitConnectorReady();
-
-		final var newAdd = new OutObject<Boolean>();
-		newAdd.value = false;
-		var subState = subscribeStates.computeIfAbsent(info.getServiceName(), __ -> {
-			newAdd.value = true;
-			return new SubscribeState(info);
-		});
-
-		if (newAdd.value) {
-			try {
-				var r = new Subscribe(info);
-				r.SendAndWaitCheckResultCode(client.getSocket());
-				logger.debug("SubscribeService {}", info);
-			} catch (Throwable ex) { // rethrow
-				// rollback.
-				subscribeStates.remove(info.getServiceName()); // rollback
-				throw ex;
-			}
-		}
-		return subState;
+		new UnSubscribe(arg).SendAndWaitCheckResultCode(client.getSocket());
+		logger.debug("unSubscribeService: {}", arg);
+		for (var serviceName : arg.serviceNames)
+			subscribeStates.remove(serviceName);
 	}
 
 	@Override
-	public void unSubscribeService(String serviceName) {
-		waitConnectorReady();
-
-		var state = subscribeStates.remove(serviceName);
-		if (state != null) {
-			try {
-				var r = new UnSubscribe(state.subscribeInfo);
-				r.SendAndWaitCheckResultCode(client.getSocket());
-				logger.debug("UnSubscribeService {}", state.subscribeInfo);
-			} catch (Throwable e) { // rethrow
-				// rollback.
-				subscribeStates.putIfAbsent(serviceName, state); // rollback
-				throw e;
-			}
-		}
-	}
-
-	@Override
-	public void offlineRegister(BOfflineNotify argument, Action1<BOfflineNotify> handle) {
+	public void offlineRegister(@NotNull BOfflineNotify argument, @NotNull Action1<BOfflineNotify> handle) {
 		waitConnectorReady();
 		onOfflineNotifies.putIfAbsent(argument.notifyId, handle);
 		new OfflineRegister(argument).SendAndWaitCheckResultCode(client.getSocket());
 	}
 
 	@Override
-	public boolean setServerLoad(BServerLoad load) {
+	public boolean setServerLoad(@NotNull BServerLoad load) {
 		return new SetServerLoad(load).Send(client.getSocket());
 	}
 
 	@Override
-	protected void allocate(AutoKey autoKey, int pool) {
+	protected boolean allocateAsync(String globalName, int allocCount,
+									ProtocolHandle<Rpc<BAllocateIdArgument, BAllocateIdResult>> callback) {
+		if (allocCount < 1)
+			throw new IllegalArgumentException();
+		var r = new AllocateId();
+		r.Argument.setName(globalName);
+		r.Argument.setCount(allocCount);
+		return r.Send(client.getSocket(), callback);
+	}
+
+	@Override
+	protected void allocate(@NotNull AutoKey autoKey, int pool) {
 		if (pool < 1)
 			throw new IllegalArgumentException();
 		var r = new AllocateId();
@@ -170,97 +155,61 @@ public final class Agent extends AbstractAgent {
 		autoKey.setCurrentAndCount(r.Result.getStartId(), r.Result.getCount());
 	}
 
-	@Override
-	protected boolean sendReadyList(String serviceName, long serialId) {
-		var r = new ReadyServiceList();
-		r.Argument.serviceName = serviceName;
-		r.Argument.serialId = serialId;
-		var s = client.getSocket();
-		return s != null && s.Send(r);
-	}
-
 	public void onConnected() {
-		for (var e : registers.keySet()) {
-			try {
-				new Register(e).SendAndWaitCheckResultCode(client.getSocket());
-			} catch (Throwable ex) { // logger.debug
-				// skip and continue.
-				logger.debug("OnConnected.Register={}", e, ex);
-			}
+		var edit = new BEditService();
+		edit.getAdd().addAll(registers.keySet());
+		try {
+			editService(edit);
+		} catch (Throwable ex) { // logger.debug
+			// skip and continue.
+			logger.debug("OnConnected.Register", ex);
 		}
-		for (var e : subscribeStates.values()) {
-			try {
-				e.committed = false;
-				var r = new Subscribe();
-				r.Argument = e.subscribeInfo;
-				r.SendAndWaitCheckResultCode(client.getSocket());
-			} catch (Throwable ex) { // logger.debug
-				// skip and continue.
-				logger.debug("OnConnected.Subscribe={}", e.subscribeInfo, ex);
-			}
+
+		var subArg = new BSubscribeArgument();
+		for (var e : subscribeStates.values())
+			subArg.subs.add(e.getSubscribeInfo());
+
+		subscribeServicesAsync(subArg);
+	}
+
+	private long processEditService(@NotNull EditService r) {
+		for (var it = r.Argument.getRemove().iterator(); it.hasNext(); ) {
+			var unReg = it.next();
+			var state = subscribeStates.get(unReg.getServiceName());
+			if (null == state || !state.onUnRegister(unReg))
+				it.remove();
 		}
-	}
 
-	private long processRegister(Register r) {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state == null)
-			return Update.ServiceNotSubscribe;
-		state.onRegister(r.Argument);
+		// 触发回调前修正集合之间的关系。
+		// 删除后来又加入的。
+		r.Argument.getRemove().removeIf(r.Argument.getAdd()::contains);
+
+		for (var reg : r.Argument.getAdd()) {
+			var state = subscribeStates.get(reg.getServiceName());
+			if (null == state)
+				continue; // 忽略本地没有订阅的。最好加个日志。
+			var oldNotSame = state.onRegister(reg);
+			if (null != oldNotSame)
+				r.Argument.getRemove().add(oldNotSame);
+		}
+
 		r.SendResult();
+		try {
+			triggerOnChanged(r.Argument);
+		} catch (Throwable e) { // logger.error
+			logger.error("processEditService: triggerOnChanged exception:", e);
+		}
 		return 0;
 	}
 
-	private long processUnRegister(UnRegister r) {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state == null)
-			return Update.ServiceNotSubscribe;
-		state.onUnRegister(r.Argument);
-		r.SendResult();
-		return 0;
-	}
-
-	private long processUpdate(Update r) {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state == null)
-			return Update.ServiceNotSubscribe;
-		state.onUpdate(r.Argument);
-		r.SendResult();
-		return 0;
-	}
-
-	private long processNotifyServiceList(NotifyServiceList r) {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state != null)
-			state.onNotify(r.Argument);
-		else
-			logger.warn("NotifyServiceList But SubscribeState Not Found.");
-		return Procedure.Success;
-	}
-
-	private long processSubscribeFirstCommit(SubscribeFirstCommit r) {
-		var state = subscribeStates.get(r.Argument.getServiceName());
-		if (state != null)
-			state.onFirstCommit(r.Argument);
-		return Procedure.Success;
-	}
-
-	private long processCommitServiceList(CommitServiceList r) {
-		var state = subscribeStates.get(r.Argument.serviceName);
-		if (state != null)
-			state.onCommit(r.Argument);
-		else
-			logger.warn("CommitServiceList But SubscribeState Not Found.");
-		return Procedure.Success;
-	}
-
-	private long processKeepAlive(KeepAlive r) {
+	private long processKeepAlive(@NotNull KeepAlive r) {
 		if (onKeepAlive != null)
 			Task.getCriticalThreadPool().execute(onKeepAlive);
 		r.SendResultCode(KeepAlive.Success);
 		return Procedure.Success;
 	}
 
-	private long processSetServerLoad(SetServerLoad setServerLoad) {
+	private long processSetServerLoad(@NotNull SetServerLoad setServerLoad) {
 		loads.put(setServerLoad.Argument.getName(), setServerLoad.Argument);
 		if (onSetServerLoad != null) {
 			Task.getCriticalThreadPool().execute(() -> {
@@ -275,7 +224,7 @@ public final class Agent extends AbstractAgent {
 		return Procedure.Success;
 	}
 
-	private long processOfflineNotify(OfflineNotify r) {
+	private long processOfflineNotify(@NotNull OfflineNotify r) {
 		try {
 			if (triggerOfflineNotify(r.Argument)) {
 				r.SendResult();
@@ -289,33 +238,23 @@ public final class Agent extends AbstractAgent {
 		return 0;
 	}
 
-	public Agent(Config config) {
+	public Agent(@NotNull Config config) {
 		this(config, null);
 	}
 
-	public Agent(Config config, String netServiceName) {
+	public Agent(@NotNull Config config, @Nullable String netServiceName) {
 		super.config = config;
 
 		client = (null == netServiceName || netServiceName.isEmpty())
 				? new AgentClient(this, config)
 				: new AgentClient(this, config, netServiceName);
 
-		client.AddFactoryHandle(Register.TypeId_, new ProtocolFactoryHandle<>(
-				Register::new, this::processRegister, TransactionLevel.None, DispatchMode.Direct));
-		client.AddFactoryHandle(UnRegister.TypeId_, new ProtocolFactoryHandle<>(
-				UnRegister::new, this::processUnRegister, TransactionLevel.None, DispatchMode.Direct));
-		client.AddFactoryHandle(Update.TypeId_, new ProtocolFactoryHandle<>(
-				Update::new, this::processUpdate, TransactionLevel.None, DispatchMode.Direct));
+		client.AddFactoryHandle(EditService.TypeId_, new ProtocolFactoryHandle<>(
+				EditService::new, this::processEditService, TransactionLevel.None, DispatchMode.Direct));
 		client.AddFactoryHandle(Subscribe.TypeId_, new ProtocolFactoryHandle<>(
 				Subscribe::new, null, TransactionLevel.None, DispatchMode.Direct));
 		client.AddFactoryHandle(UnSubscribe.TypeId_, new ProtocolFactoryHandle<>(
 				UnSubscribe::new, null, TransactionLevel.None, DispatchMode.Direct));
-		client.AddFactoryHandle(NotifyServiceList.TypeId_, new ProtocolFactoryHandle<>(
-				NotifyServiceList::new, this::processNotifyServiceList, TransactionLevel.None, DispatchMode.Direct));
-		client.AddFactoryHandle(SubscribeFirstCommit.TypeId_, new ProtocolFactoryHandle<>(
-				SubscribeFirstCommit::new, this::processSubscribeFirstCommit, TransactionLevel.None, DispatchMode.Direct));
-		client.AddFactoryHandle(CommitServiceList.TypeId_, new ProtocolFactoryHandle<>(
-				CommitServiceList::new, this::processCommitServiceList, TransactionLevel.None, DispatchMode.Direct));
 		client.AddFactoryHandle(KeepAlive.TypeId_, new ProtocolFactoryHandle<>(
 				KeepAlive::new, this::processKeepAlive, TransactionLevel.None, DispatchMode.Direct));
 		client.AddFactoryHandle(AllocateId.TypeId_, new ProtocolFactoryHandle<>(
@@ -339,16 +278,19 @@ public final class Agent extends AbstractAgent {
 		return threading;
 	}
 
-	public synchronized void stop() throws Exception {
-		if (client != null) {
+	public void stop() throws Exception {
+		lock();
+		try {
 			var so = client.getSocket();
 			if (so != null) // 有可能提前关闭,so==null时执行下面这行会抛异常
 				new NormalClose().SendAndWaitCheckResultCode(so);
 			client.stop();
-		}
-		if (null != threading) {
-			threading.close();
-			threading = null;
+			if (threading != null) {
+				threading.close();
+				threading = null;
+			}
+		} finally {
+			unlock();
 		}
 	}
 

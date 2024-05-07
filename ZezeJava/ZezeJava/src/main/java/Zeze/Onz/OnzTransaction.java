@@ -5,7 +5,8 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Builtin.Onz.BSavedCommits;
 import Zeze.Builtin.Onz.Checkpoint;
 import Zeze.Builtin.Onz.Commit;
@@ -22,7 +23,7 @@ import Zeze.Util.TaskCompletionSource;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-public abstract class OnzTransaction<A extends Data, R extends Data> {
+public abstract class OnzTransaction<A extends Data, R extends Data> extends ReentrantLock {
 	protected static final Logger logger = LogManager.getLogger();
 
 	private OnzServer onzServer;
@@ -31,16 +32,27 @@ public abstract class OnzTransaction<A extends Data, R extends Data> {
 	private A argument;
 	private R result;
 	private boolean pendingAsync = false;
+	private final Condition thisCond = newCondition();
 
-	synchronized void waitPendingAsync() throws InterruptedException {
-		while (pendingAsync) {
-			this.wait();
+	void waitPendingAsync() throws InterruptedException {
+		lock();
+		try {
+			while (pendingAsync) {
+				thisCond.await();
+			}
+		} finally {
+			unlock();
 		}
 	}
 
-	public synchronized void setPendingAsync(boolean pending) {
-		this.pendingAsync = pending;
-		this.notify();
+	public void setPendingAsync(boolean pending) {
+		lock();
+		try {
+			this.pendingAsync = pending;
+			this.notify();
+		} finally {
+			unlock();
+		}
 	}
 
 	protected abstract long perform() throws Exception;
@@ -84,7 +96,7 @@ public abstract class OnzTransaction<A extends Data, R extends Data> {
 
 	// 远程调用辅助函数
 	public <A2 extends Data, R2 extends Data> TaskCompletionSource<R2>
-		callProcedureAsync(String zezeName, String onzProcedureName, A2 argument, R2 result) {
+	callProcedureAsync(String zezeName, String onzProcedureName, A2 argument, R2 result) {
 		// procedure sage 互斥。
 		if (!zezeSagas.isEmpty())
 			throw new RuntimeException("can not mix funcProcedure and funcSaga. saga has called.");
@@ -100,7 +112,7 @@ public abstract class OnzTransaction<A extends Data, R extends Data> {
 	}
 
 	public <A2 extends Data, R2 extends Data> TaskCompletionSource<R2>
-		callSagaAsync(String zezeName, String onzProcedureName, A2 argument, R2 result) {
+	callSagaAsync(String zezeName, String onzProcedureName, A2 argument, R2 result) {
 		// procedure sage 互斥。
 		if (!zezeProcedures.isEmpty())
 			throw new RuntimeException("can not mix funcProcedure and funcSaga. procedure has called.");
@@ -109,7 +121,7 @@ public abstract class OnzTransaction<A extends Data, R extends Data> {
 		var newCall = new OutObject<TaskCompletionSource<R2>>();
 		zezeSagas.computeIfAbsent(zezeInstance, __ -> newCall.value
 				= OnzAgent.callSagaAsync(
-					this, zezeInstance, onzProcedureName, argument, result, flushMode));
+				this, zezeInstance, onzProcedureName, argument, result, flushMode));
 		if (newCall.value == null)
 			throw new RuntimeException("too many funcSaga on same zezeInstance.");
 		return newCall.value;
@@ -135,7 +147,7 @@ public abstract class OnzTransaction<A extends Data, R extends Data> {
 		for (var saga : zezeSagas.values()) {
 			try {
 				saga.get();
-			} catch (InterruptedException | ExecutionException e) {
+			} catch (Exception e) {
 				logger.error("await saga result.", e);
 			}
 		}
@@ -147,14 +159,14 @@ public abstract class OnzTransaction<A extends Data, R extends Data> {
 					r.Argument.setCancel(true);
 					futures.add(r.SendForWait(e.getKey()));
 				}
-			} catch (InterruptedException | ExecutionException ex) {
+			} catch (Exception ex) {
 				logger.error("cancel if saga success.", ex);
 			}
 		}
 		for (var future : futures) {
 			try {
 				future.get();
-			} catch (InterruptedException | ExecutionException e) {
+			} catch (Exception e) {
 				logger.error("await cancel result.", e);
 			}
 		}
@@ -190,7 +202,7 @@ public abstract class OnzTransaction<A extends Data, R extends Data> {
 			r.Argument.setOnzTid(onzTid);
 			r.SendForWait(zeze).await();
 			if (r.getResultCode() != 0)
-				logger.fatal("commit error " + IModule.getErrorCode(r.getResultCode()));
+				logger.fatal("commit error {}", IModule.getErrorCode(r.getResultCode()));
 		}
 
 		// 对于procedure，下面函数里面访问的zezeSagas是空的。
@@ -207,7 +219,7 @@ public abstract class OnzTransaction<A extends Data, R extends Data> {
 			r.Argument.setOnzTid(onzTid);
 			r.SendForWait(zeze).await();
 			if (r.getResultCode() != 0) {
-				logger.fatal("rollback error " + IModule.getErrorCode(r.getResultCode()));
+				logger.fatal("rollback error {}", IModule.getErrorCode(r.getResultCode()));
 			}
 		}
 
@@ -219,7 +231,7 @@ public abstract class OnzTransaction<A extends Data, R extends Data> {
 		if (flushMode == Onz.eFlushImmediately) {
 			try {
 				flushDone.get(flushTimeout, TimeUnit.MILLISECONDS);
-			} catch (InterruptedException | ExecutionException | TimeoutException e) {
+			} catch (Exception e) {
 				logger.warn("waitFlushDone", e);
 				// 马上回复现有的flushReady。允许它们继续flush。降为FlushAsync。
 				for (var ready : flushReadies)

@@ -24,8 +24,8 @@ import Zeze.Transaction.DispatchMode;
 import Zeze.Transaction.Procedure;
 import Zeze.Transaction.TransactionLevel;
 import Zeze.Util.Action1;
+import Zeze.Util.ConcurrentHashMapOrdered;
 import Zeze.Util.Func3;
-import Zeze.Util.LongConcurrentHashMap;
 import Zeze.Util.OutObject;
 import Zeze.Util.PersistentAtomicLong;
 import Zeze.Util.Random;
@@ -46,14 +46,12 @@ public final class Agent {
 	private RaftConfig raftConfig;
 	private NetClient client;
 	private volatile ConnectorProxy leader;
-	private final LongConcurrentHashMap<RaftRpc<?, ?>> pending = new LongConcurrentHashMap<>();
+	private final ConcurrentHashMapOrdered<Long, RaftRpc<?, ?>> pending = new ConcurrentHashMapOrdered<>();
 	private long term;
 	public boolean dispatchProtocolToInternalThreadPool;
-	private int pendingLimit = 5000; // -1 no limit
+	private volatile int pendingLimit = -1; // -1 no limit // 实际上没有进行线程保护。
 	private Future<?> resendTask;
 
-	// 加急请求ReSend时优先发送，多个请求不保证顺序。这个应该仅用于Login之类的特殊协议，一般来说只有一个。
-	private final LongConcurrentHashMap<RaftRpc<?, ?>> urgentPending = new LongConcurrentHashMap<>();
 	private Action1<Agent> onSetLeader;
 	private final Lock mutex = new ReentrantLock();
 	private final ProxyAgent proxyAgent;
@@ -94,17 +92,11 @@ public final class Agent {
 		this.onSetLeader = onSetLeader;
 	}
 
-	public <TArgument extends Serializable, TResult extends Serializable> void send(RaftRpc<TArgument, TResult> rpc,
-																					ToLongFunction<Protocol<?>> handle) {
-		send(rpc, handle, false);
-	}
-
 	/**
 	 * 发送Rpc请求。
 	 */
-	public <TArgument extends Serializable, TResult extends Serializable> void send(RaftRpc<TArgument, TResult> rpc,
-																					ToLongFunction<Protocol<?>> handle,
-																					boolean urgent) {
+	public <TArgument extends Serializable, TResult extends Serializable>
+	void send(RaftRpc<TArgument, TResult> rpc, ToLongFunction<Protocol<?>> handle) {
 		if (handle == null)
 			throw new IllegalArgumentException("null handle");
 		if (pendingLimit > 0 && pending.size() > pendingLimit) // UrgentPending不限制。
@@ -124,8 +116,6 @@ public final class Agent {
 		if (rpc.getTimeout() == 0) // set default timeout
 			rpc.setTimeout(raftConfig.getAgentTimeout());
 
-		rpc.setUrgent(urgent);
-		var pending = urgent ? urgentPending : this.pending;
 		rpc.handle = handle;
 		if (pending.putIfAbsent(rpc.getUnique().getRequestId(), rpc) != null)
 			throw new IllegalStateException("duplicate requestId rpc=" + rpc);
@@ -137,14 +127,14 @@ public final class Agent {
 			logger.debug("Send failed: leader={}, rpc={}", leader, rpc);
 	}
 
-	private <TArgument extends Serializable, TResult extends Serializable> long sendHandle(Rpc<TArgument, TResult> p,
-																						   RaftRpc<TArgument, TResult> rpc) {
+	private <TArgument extends Serializable, TResult extends Serializable>
+	long sendHandle(Rpc<TArgument, TResult> p, RaftRpc<TArgument, TResult> rpc) {
 		var net = (RaftRpc<TArgument, TResult>)p;
 		if (net.isTimeout() || isRetryError(net.getResultCode()))
 			return Procedure.Success; // Pending Will Resend.
 
 		long requestId = rpc.getUnique().getRequestId();
-		if (pending.remove(requestId) != null || urgentPending.remove(requestId) != null) {
+		if (pending.remove(requestId) != null) {
 			rpc.setRequest(net.isRequest());
 			rpc.Result = net.Result;
 			rpc.setSender(net.getSender());
@@ -152,9 +142,10 @@ public final class Agent {
 
 			if (rpc.getResultCode() == Procedure.RaftApplied)
 				rpc.setIsTimeout(false);
-			if (isDebugEnabled)
+			if (isDebugEnabled) {
 				logger.debug("Agent Rpc={} RequestId={} ResultCode={} Sender={}",
 						rpc.getClass().getSimpleName(), requestId, rpc.getResultCode(), rpc.getSender());
+			}
 			return rpc.handle.applyAsLong(rpc);
 		}
 		return Procedure.Success;
@@ -167,14 +158,14 @@ public final class Agent {
 	}
 
 	@SuppressWarnings("SameReturnValue")
-	private <TArgument extends Serializable, TResult extends Serializable> long sendForWaitHandle(Rpc<TArgument, TResult> p,
-																								  RaftRpc<TArgument, TResult> rpc) {
+	private <TArgument extends Serializable, TResult extends Serializable>
+	long sendForWaitHandle(Rpc<TArgument, TResult> p, RaftRpc<TArgument, TResult> rpc) {
 		var net = (RaftRpc<TArgument, TResult>)p;
 		if (net.isTimeout() || isRetryError(net.getResultCode()))
 			return Procedure.Success; // Pending Will Resend.
 
 		long requestId = rpc.getUnique().getRequestId();
-		if (pending.remove(requestId) != null || urgentPending.remove(requestId) != null) {
+		if (pending.remove(requestId) != null) {
 			rpc.setRequest(net.isRequest());
 			rpc.Result = net.Result;
 			rpc.setSender(net.getSender());
@@ -182,21 +173,17 @@ public final class Agent {
 
 			if (rpc.getResultCode() == Procedure.RaftApplied)
 				rpc.setIsTimeout(false);
-			if (isDebugEnabled)
+			if (isDebugEnabled) {
 				logger.debug("Agent Rpc={} RequestId={} ResultCode={} Sender={}",
 						rpc.getClass().getSimpleName(), requestId, rpc.getResultCode(), rpc.getSender());
+			}
 			rpc.future.setResult(rpc);
 		}
 		return Procedure.Success;
 	}
 
-	public <TArgument extends Serializable, TResult extends Serializable> TaskCompletionSourceX<RaftRpc<TArgument, TResult>>
-		sendForWait(RaftRpc<TArgument, TResult> rpc) {
-		return sendForWait(rpc, false);
-	}
-
-	public <TArgument extends Serializable, TResult extends Serializable> TaskCompletionSourceX<RaftRpc<TArgument, TResult>>
-		sendForWait(RaftRpc<TArgument, TResult> rpc, boolean urgent) {
+	public <TArgument extends Serializable, TResult extends Serializable>
+	TaskCompletionSourceX<RaftRpc<TArgument, TResult>> sendForWait(RaftRpc<TArgument, TResult> rpc) {
 		if (pendingLimit > 0 && pending.size() > pendingLimit) // UrgentPending不限制。
 			throw new IllegalStateException("too many pending");
 		// 由于interface不能把setter弄成保护的，实际上外面可以修改。
@@ -214,8 +201,6 @@ public final class Agent {
 			rpc.setTimeout(raftConfig.getAgentTimeout());
 
 		var future = new TaskCompletionSourceX<RaftRpc<TArgument, TResult>>();
-		rpc.setUrgent(urgent);
-		var pending = urgent ? urgentPending : this.pending;
 		rpc.future = future;
 		if (pending.putIfAbsent(rpc.getUnique().getRequestId(), rpc) != null)
 			throw new IllegalStateException("duplicate requestId rpc=" + rpc);
@@ -247,7 +232,8 @@ public final class Agent {
 
 		/**
 		 * 启用代理构造函数
-		 * @param raftName raftName
+		 *
+		 * @param raftName  raftName
 		 * @param connector connector
 		 */
 		public ConnectorProxy(String raftName, Connector connector) {
@@ -257,6 +243,7 @@ public final class Agent {
 
 		/**
 		 * 没有启用代理构造函数
+		 *
 		 * @param connector connector
 		 */
 		public ConnectorProxy(Connector connector) {
@@ -279,8 +266,10 @@ public final class Agent {
 			client = null;
 
 			leader = null;
+
+			trigger(pending, "stopPending");
+
 			pending.clear();
-			urgentPending.clear();
 		} finally {
 			mutex.unlock();
 		}
@@ -478,27 +467,6 @@ public final class Agent {
 		ArrayList<RaftRpc<?, ?>> removed = null;
 		long now = System.currentTimeMillis();
 		long timeout = raftConfig.getAppendEntriesTimeout() + 200; // 比一次raft-rpc超时大一些。
-		for (var rpc : urgentPending) {
-			if (rpc.getTimeout() > 0 && now - rpc.getCreateTime() > rpc.getTimeout()) {
-				rpc = urgentPending.remove(rpc.getUnique().getRequestId());
-				if (rpc != null) {
-					if (removed == null)
-						removed = new ArrayList<>();
-					removed.add(rpc);
-				}
-				continue;
-			}
-			if ((immediately && now - rpc.getCreateTime() > timeout)
-					|| now - rpc.getSendTime() > timeout) {
-				if (isDebugEnabled)
-					logger.debug("ReSendU {}/{} {}", urgentPending.size(), leaderSocket, rpc);
-				rpc.setSendTime(now);
-				if (!ProxyAgent.send(client, proxyAgent, rpc, leader, leaderSocket)) {
-					logger.info("SendRequest failed {}", rpc);
-					break;
-				}
-			}
-		}
 		for (var rpc : pending) {
 			if (rpc.getTimeout() > 0 && now - rpc.getCreateTime() > rpc.getTimeout()) {
 				rpc = pending.remove(rpc.getUnique().getRequestId());
@@ -528,11 +496,11 @@ public final class Agent {
 		}
 	}
 
-	private static void trigger(ArrayList<RaftRpc<?, ?>> removed) {
+	private static void trigger(Iterable<RaftRpc<?, ?>> removed) {
 		trigger(removed, "Timeout");
 	}
 
-	private static void trigger(ArrayList<RaftRpc<?, ?>> removed, String reason) {
+	private static void trigger(Iterable<RaftRpc<?, ?>> removed, String reason) {
 		for (var r : removed) {
 			if (null == r)
 				continue;
@@ -705,6 +673,7 @@ public final class Agent {
 
 	/**
 	 * 把Leader赶回主机房（建议节点成为Leader）。
+	 *
 	 * @param raftConfig raftConfig
 	 * @return null，表示成功，！null表示错误描述。
 	 */
@@ -738,10 +707,8 @@ public final class Agent {
 				leaderNode = raftConfig.getNodes().get(leader.getName());
 			}
 			return null;
-
 		} catch (Exception ex) {
 			return ex.toString();
-
 		} finally {
 			// 重启所有停掉的节点；
 			for (var stopped : stoppeds) {

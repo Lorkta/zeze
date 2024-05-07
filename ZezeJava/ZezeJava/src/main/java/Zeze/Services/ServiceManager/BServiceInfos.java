@@ -1,102 +1,77 @@
 package Zeze.Services.ServiceManager;
 
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Serialize.IByteBuffer;
-import Zeze.Services.ServiceManagerServer;
-import Zeze.Transaction.Bean;
-import Zeze.Transaction.Record;
+import Zeze.Serialize.Serializable;
+import Zeze.Util.FewModifyList;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
-public final class BServiceInfos extends Bean {
-	private static final Comparator<BServiceInfo> Comparer = (si1, si2) -> {
-		String id1 = si1.getServiceIdentity();
-		String id2 = si2.getServiceIdentity();
-		return id1.compareTo(id2);
+public final class BServiceInfos implements Serializable {
+	public static final Comparator<BServiceInfo> comparer = (si1, si2) -> {
+		var id1 = si1.getServiceIdentity();
+		var id2 = si2.getServiceIdentity();
+		if (id1.isEmpty() || id1.charAt(0) == '@' || id2.isEmpty() || id2.charAt(0) == '@')
+			return id1.compareTo(id2);
+		return Long.compare(Long.parseLong(id1), Long.parseLong(id2));
 	};
 
-	// ServiceList maybe empty. need a ServiceName
-	public String serviceName;
-	// sorted by ServiceIdentity
-	public final ArrayList<BServiceInfo> serviceInfoListSortedByIdentity = new ArrayList<>();
-	public long serialId;
+	private final FewModifyList<BServiceInfo> sortedIdentities = new FewModifyList<>(); // sorted by ServiceIdentity
 
-	public BServiceInfos() {
+	public @NotNull FewModifyList<BServiceInfo> getSortedIdentities() {
+		return sortedIdentities;
 	}
 
-	public BServiceInfos(String serviceName) {
-		this.serviceName = serviceName;
+	/**
+	 * @return old BServiceInfo
+	 */
+	public @Nullable BServiceInfo insert(@NotNull BServiceInfo info) {
+		int index = Collections.binarySearch(sortedIdentities, info, comparer);
+		if (index >= 0) {
+			var exist = sortedIdentities.get(index);
+			sortedIdentities.set(index, info);
+			return exist;
+		}
+		sortedIdentities.add(~index, info);
+		return null;
 	}
 
-	public BServiceInfos(String serviceName, ServiceManagerServer.ServerState state, long serialId) {
-		this.serviceName = serviceName;
-		state.getServiceInfos(serviceInfoListSortedByIdentity);
-		serviceInfoListSortedByIdentity.sort(Comparer);
-		this.serialId = serialId;
+	public @Nullable BServiceInfo remove(@NotNull BServiceInfo info) {
+		int index = Collections.binarySearch(sortedIdentities, info, comparer);
+		return index >= 0 ? sortedIdentities.remove(index) : null;
 	}
 
-	public String getServiceName() {
-		return serviceName;
+	public @Nullable BServiceInfo findServiceInfo(@NotNull BServiceInfo info) {
+		int index = Collections.binarySearch(sortedIdentities, info, comparer);
+		return index >= 0 ? sortedIdentities.get(index) : null;
 	}
 
-	public ArrayList<BServiceInfo> getServiceInfoListSortedByIdentity() {
-		return serviceInfoListSortedByIdentity;
+	public @Nullable BServiceInfo findServiceInfoByIdentity(@NotNull String identity) {
+		return findServiceInfo(new BServiceInfo("", identity, 0)); // 比较时只看identity
 	}
 
-	public long getSerialId() {
-		return serialId;
-	}
-
-	public void insert(BServiceInfo info) {
-		int index = Collections.binarySearch(serviceInfoListSortedByIdentity, info, Comparer);
-		if (index >= 0)
-			serviceInfoListSortedByIdentity.set(index, info);
-		else
-			serviceInfoListSortedByIdentity.add(~index, info);
-	}
-
-	public BServiceInfo remove(BServiceInfo info) {
-		int index = Collections.binarySearch(serviceInfoListSortedByIdentity, info, Comparer);
-		return index >= 0 ? serviceInfoListSortedByIdentity.remove(index) : null;
-	}
-
-	public BServiceInfo findServiceInfo(BServiceInfo info) {
-		int index = Collections.binarySearch(serviceInfoListSortedByIdentity, info, Comparer);
-		return index >= 0 ? serviceInfoListSortedByIdentity.get(index) : null;
-	}
-
-	public BServiceInfo findServiceInfoByIdentity(String identity) {
-		return findServiceInfo(new BServiceInfo(serviceName, identity));
-	}
-
-	public BServiceInfo findServiceInfoByServerId(int serverId) {
+	public @Nullable BServiceInfo findServiceInfoByServerId(int serverId) {
 		return findServiceInfoByIdentity(String.valueOf(serverId));
 	}
 
 	@Override
-	public void decode(IByteBuffer bb) {
-		serviceName = bb.ReadString();
-		serviceInfoListSortedByIdentity.clear();
-		for (int c = bb.ReadInt(); c > 0; --c) {
-			var service = new BServiceInfo();
-			service.decode(bb);
-			serviceInfoListSortedByIdentity.add(service);
-		}
-		serialId = bb.ReadLong();
+	public void decode(@NotNull IByteBuffer bb) {
+		sortedIdentities.clear();
+		for (int c = bb.ReadUInt(); c > 0; --c)
+			sortedIdentities.add(new BServiceInfo(bb));
 	}
 
 	@Override
-	public void encode(ByteBuffer bb) {
-		bb.WriteString(serviceName);
-		bb.WriteInt(serviceInfoListSortedByIdentity.size());
-		for (var service : serviceInfoListSortedByIdentity) {
+	public void encode(@NotNull ByteBuffer bb) {
+		bb.WriteUInt(sortedIdentities.size());
+		for (var service : sortedIdentities) {
 			service.encode(bb);
 		}
-		bb.WriteLong(serialId);
 	}
 
-	private static int _PRE_ALLOC_SIZE_ = 16;
+	private static int _PRE_ALLOC_SIZE_ = 32;
 
 	@Override
 	public int preAllocSize() {
@@ -109,25 +84,7 @@ public final class BServiceInfos extends Bean {
 	}
 
 	@Override
-	protected void initChildrenRootInfo(Record.RootInfo root) {
-		throw new UnsupportedOperationException();
-	}
-
-	@Override
-	protected void initChildrenRootInfoWithRedo(Record.RootInfo root) {
-		throw new UnsupportedOperationException();
-	}
-
-	@Override
-	public String toString() {
-		var sb = new StringBuilder();
-		sb.append(serviceName).append(" Version=").append(serialId);
-		sb.append("[");
-		for (var e : serviceInfoListSortedByIdentity) {
-			sb.append(e.getServiceIdentity());
-			sb.append(",");
-		}
-		sb.append("]");
-		return sb.toString();
+	public @NotNull String toString() {
+		return "BServiceInfos" + sortedIdentities;
 	}
 }

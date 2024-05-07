@@ -1,6 +1,5 @@
 package Zeze.Arch;
 
-import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import Zeze.Application;
@@ -14,9 +13,10 @@ import Zeze.IModule;
 import Zeze.Net.AsyncSocket;
 import Zeze.Net.Connector;
 import Zeze.Net.Protocol;
+import Zeze.Net.ProtocolHandle;
 import Zeze.Services.HandshakeClient;
 import Zeze.Services.ServiceManager.BServiceInfo;
-import Zeze.Services.ServiceManager.BServiceInfos;
+import Zeze.Services.ServiceManager.BSubscribeInfo;
 import Zeze.Util.OutObject;
 import Zeze.Util.Task;
 import Zeze.Util.TaskCompletionSource;
@@ -26,11 +26,11 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public class ProviderService extends HandshakeClient {
-	private static final Logger logger = LogManager.getLogger(ProviderService.class);
+	private static final @NotNull Logger logger = LogManager.getLogger(ProviderService.class);
 
 	protected ProviderApp providerApp;
 	private final ConcurrentHashMap<String, Connector> links = new ConcurrentHashMap<>();
-	private volatile @NotNull Connector[] linkConnectors = new Connector[0];
+	private volatile @NotNull Connector @NotNull [] linkConnectors = new Connector[0];
 	private final AtomicInteger linkRandomIndex = new AtomicInteger();
 
 	// 用来同步等待Provider的静态绑定完成。
@@ -71,38 +71,36 @@ public class ProviderService extends HandshakeClient {
 		super.start();
 	}
 
-	public @Nullable Connector apply(@NotNull BServiceInfo link) {
+	public boolean applyPut(@NotNull BServiceInfo link) {
 		var linkName = getLinkName(link);
-		return links.computeIfAbsent(linkName, __ -> {
+		var isNew = new OutObject<>(false);
+		links.computeIfAbsent(linkName, __ -> {
 			var outC = new OutObject<Connector>();
 			if (getConfig().tryGetOrAddConnector(link.getPassiveIp(), link.getPassivePort(), true, outC)) {
 				try {
 					outC.value.start();
+					isNew.value = true;
 				} catch (Exception e) {
 					Task.forceThrow(e);
 				}
 			}
 			return outC.value;
 		});
+		return isNew.value;
 	}
 
-	public void apply(@NotNull BServiceInfos serviceInfos) {
-		var current = new HashSet<String>();
-		for (var link : serviceInfos.getServiceInfoListSortedByIdentity()) {
-			var connector = apply(link);
-			if (connector != null)
-				current.add(connector.getName());
+	public boolean applyRemove(@NotNull BServiceInfo link) {
+		var linkName = getLinkName(link);
+		var removed = links.remove(linkName);
+		if (removed != null) {
+			getConfig().removeConnector(removed);
+			removed.stop();
+			return true;
 		}
-		// 删除多余的连接器。
-		for (var linkName : links.keySet()) {
-			if (current.contains(linkName))
-				continue;
-			var removed = links.remove(linkName);
-			if (removed != null) {
-				getConfig().removeConnector(removed);
-				removed.stop();
-			}
-		}
+		return false;
+	}
+
+	public void refreshLinkConnectors() {
 		linkConnectors = links.values().toArray(new Connector[links.size()]);
 	}
 
@@ -122,20 +120,27 @@ public class ProviderService extends HandshakeClient {
 
 	private volatile boolean disableChoice = false;
 
-	public synchronized void initDisableChoiceFromLinks(boolean value) {
-		disableChoice = value;
+	public void initDisableChoiceFromLinks(boolean value) {
+		lock();
+		try {
+			disableChoice = value;
+		} finally {
+			unlock();
+		}
 	}
 
 	public void setDisableChoiceFromLinks(boolean value) {
 		// ProviderApp 构造的时候初始化，相当于final了。
 		// 这样写是为了用户不用在构造ProviderService的时候传参数。
-		//noinspection SynchronizeOnNonFinalField
-		synchronized (providerApp) {
+		providerApp.lock();
+		try {
 			if (!providerApp.isOnlineReady())
 				throw new RuntimeException("online not ready.");
 			providerApp.setUserDisableChoice(value);
 			for (var link : links.values())
 				sendDisableChoiceToLink(link, value);
+		} finally {
+			providerApp.unlock();
 		}
 	}
 
@@ -144,12 +149,12 @@ public class ProviderService extends HandshakeClient {
 			trySetLinkChoice(link);
 	}
 
-	private void trySetLinkChoice(Connector link) {
+	private void trySetLinkChoice(@NotNull Connector link) {
 		if (providerApp.isOnlineReady())
 			sendDisableChoiceToLink(link, providerApp.isUserDisableChoice());
 	}
 
-	private static void sendDisableChoiceToLink(Connector link, boolean value) {
+	private static void sendDisableChoiceToLink(@NotNull Connector link, boolean value) {
 		var r = new SetDisableChoice();
 		r.Argument.setDisableChoice(value);
 		r.Send(link.getSocket(), (p) -> {
@@ -205,13 +210,15 @@ public class ProviderService extends HandshakeClient {
 			return 0;
 		});
 
-		trySetLinkChoice(so.getConnector());
+		var c = so.getConnector();
+		if (c != null)
+			trySetLinkChoice(c);
 	}
 
 	// 热更新增模块。
 	// 1. 热更才会调用；
 	// 2. 只有新增模块才会调用；
-	public void addHotModule(IModule module, BModule.Data config) {
+	public void addHotModule(@NotNull IModule module, @NotNull BModule.Data config) {
 		{
 			// 全局数据更新
 			providerApp.zeze.getAppBase().addModule(module);
@@ -221,10 +228,12 @@ public class ProviderService extends HandshakeClient {
 			// 注册订阅服务。
 			var sm = providerApp.zeze.getServiceManager();
 			var identity = String.valueOf(providerApp.zeze.getConfig().getServerId());
-			sm.registerService(
+			sm.registerService(new BServiceInfo(
 					providerApp.serverServiceNamePrefix + module.getId(), identity,
-					providerApp.directIp, providerApp.directPort);
-			sm.subscribeService(providerApp.serverServiceNamePrefix + module.getId(), config.getSubscribeType());
+					providerApp.zeze.getConfig().getAppVersion(),
+					providerApp.directIp, providerApp.directPort));
+			sm.subscribeService(new BSubscribeInfo(providerApp.serverServiceNamePrefix + module.getId(),
+					providerApp.zeze.getConfig().getAppVersion()));
 		}
 
 		// 并通知所有links。
@@ -243,13 +252,15 @@ public class ProviderService extends HandshakeClient {
 		}
 	}
 
+	@SuppressWarnings("unchecked")
 	@Override
-	public void dispatchProtocol(@NotNull Protocol<?> p, @NotNull ProtocolFactoryHandle<?> factoryHandle) throws Exception {
+	public void dispatchProtocol(@NotNull Protocol<?> p, @NotNull ProtocolFactoryHandle<?> factoryHandle)
+			throws Exception {
 		if (p instanceof Dispatch) {
 			//noinspection RedundantCast,DataFlowIssue
 			getZeze().getTaskOneByOneByKey().Execute(((Dispatch)p).Argument.getAccount(),
-					() -> Task.call(() -> factoryHandle.Handle.handleProtocol(p), p, Protocol::trySendResultCode),
-					factoryHandle.Mode);
+					() -> Task.call(() -> ((ProtocolHandle<Protocol<?>>)factoryHandle.Handle).handle(p),
+							p, Protocol::trySendResultCode), factoryHandle.Mode);
 		} else
 			super.dispatchProtocol(p, factoryHandle);
 	}

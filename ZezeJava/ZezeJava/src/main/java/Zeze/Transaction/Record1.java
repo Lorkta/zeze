@@ -37,6 +37,15 @@ public final class Record1<K extends Comparable<K>, V extends Bean> extends Reco
 	private boolean existInBackDatabase;
 	private boolean existInBackDatabaseSavedForFlushRemove;
 	private volatile @Nullable ConcurrentHashMap<K, Record1<K, V>> lruNode;
+	private long tid;
+
+	public void setTid(long tid) {
+		this.tid = tid;
+	}
+
+	public long getTid() {
+		return tid;
+	}
 
 	public Record1(@NotNull TableX<K, V> table, @NotNull K key, @Nullable V value) {
 		super(value);
@@ -48,7 +57,8 @@ public final class Record1<K extends Comparable<K>, V extends Bean> extends Reco
 		return getSoftValue() != null || !getDirty() && table.getLocalRocksCacheTable().containsKey(table, key);
 	}
 
-	@Nullable V copyValue() {
+	@Nullable
+	V copyValue() {
 		var v = getSoftValue();
 		if (v != null) {
 			var lockey = table.getZeze().getLocks().get(new TableKey(table.getId(), key));
@@ -68,7 +78,8 @@ public final class Record1<K extends Comparable<K>, V extends Bean> extends Reco
 		return table.getLocalRocksCacheTable().find(table, key);
 	}
 
-	@Nullable V loadValue() {
+	@Nullable
+	V loadValue() {
 		@SuppressWarnings("unchecked")
 		var v = (V)getSoftValue();
 		if (v == null && !getDirty()) {
@@ -95,7 +106,8 @@ public final class Record1<K extends Comparable<K>, V extends Bean> extends Reco
 		existInBackDatabase = value;
 	}
 
-	@Nullable ConcurrentHashMap<K, Record1<K, V>> getLruNode() {
+	@Nullable
+	ConcurrentHashMap<K, Record1<K, V>> getLruNode() {
 		return lruNode;
 	}
 
@@ -104,7 +116,8 @@ public final class Record1<K extends Comparable<K>, V extends Bean> extends Reco
 	}
 
 	@SuppressWarnings("unchecked")
-	@Nullable ConcurrentHashMap<K, Record1<K, V>> getAndSetLruNodeNull() {
+	@Nullable
+	ConcurrentHashMap<K, Record1<K, V>> getAndSetLruNodeNull() {
 		return (ConcurrentHashMap<K, Record1<K, V>>)LRU_NODE_HANDLE.getAndSet(this, null);
 	}
 
